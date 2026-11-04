@@ -6,6 +6,7 @@
 pub mod capture;
 #[cfg(test)]
 pub mod fake;
+pub mod preview;
 pub mod screencopy;
 pub mod steady;
 pub mod vdesktop;
@@ -25,6 +26,7 @@ use tt500_lcd_protocol::Frame;
 use tt500_lcd_render::{RenderError, RenderOptions, VideoPoll, render_rgb_frame};
 
 use self::capture::{CaptureError, Capturer};
+use self::preview::{Preview, PreviewCache};
 use self::screencopy::Screencopy;
 use self::steady::SteadyGate;
 use self::vdesktop::VirtualDesktop;
@@ -83,6 +85,8 @@ struct Shared {
     spec: LiveSource,
     shaping: Mutex<Shaping>,
     latest: Mutex<Option<(Arc<RgbImage>, u64)>>,
+    /// The last encoded preview (see [`PreviewCache`]).
+    preview: Mutex<PreviewCache>,
     stop: AtomicBool,
     alive: AtomicBool,
     /// What the source reports as wrong while it keeps running (see [`Capturer::problem`]).
@@ -113,6 +117,35 @@ impl LiveControl {
     #[must_use]
     pub fn latest(&self) -> Option<(Arc<RgbImage>, u64)> {
         self.0.latest.lock().expect("lock poisoned").clone()
+    }
+
+    /// A JPEG of the latest frame, downscaled to `max_width`, or `None` before the first
+    /// frame. Encoded only when asked, at most every [`preview::MIN_INTERVAL`] and not
+    /// again for a frame already encoded.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] when the frame cannot be encoded.
+    pub fn preview(&self, max_width: u32) -> Result<Option<Preview>, RenderError> {
+        let Some((img, seq)) = self.latest() else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        let mut cache = self.0.preview.lock().expect("lock poisoned");
+        if let Some(hit) = cache.fresh(now, seq) {
+            return Ok(Some(hit));
+        }
+        let jpeg = tt500_lcd_render::encode_preview_jpeg(&img, max_width)?;
+        let preview = Preview {
+            jpeg: Arc::new(jpeg),
+            size: Size {
+                width: img.width(),
+                height: img.height(),
+            },
+            seq,
+        };
+        cache.store(now, preview.clone());
+        Ok(Some(preview))
     }
 
     /// Whether the capture thread is still running.
@@ -216,6 +249,7 @@ impl LiveStream {
                 steady,
             }),
             latest: Mutex::new(None),
+            preview: Mutex::new(PreviewCache::default()),
             stop: AtomicBool::new(false),
             alive: AtomicBool::new(true),
             problem: Mutex::new(None),

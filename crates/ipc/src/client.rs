@@ -10,6 +10,7 @@ use crate::message::{
     DryRunReply, Event, EventEnvelope, IpcError, Outcome, PreviewReply, Request, RequestEnvelope,
     ServerMessage, Status, UploadBootAnimationParams, UploadStandbyParams,
 };
+use crate::profile::ProfilesReply;
 
 /// Large GIFs are rendered before the daemon replies.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,7 +42,7 @@ pub enum ClientError {
 }
 
 fn unexpected_preview() -> ClientError {
-    ClientError::Protocol("unexpected preview reply".into())
+    ClientError::Protocol("unexpected reply for this request".into())
 }
 
 /// A connection to the daemon.
@@ -85,7 +86,7 @@ impl Client {
         match self.exchange(request)? {
             Outcome::Result(status) => Ok(status),
             Outcome::DryRun(reply) => Ok(reply.status),
-            Outcome::Preview(_) => Err(unexpected_preview()),
+            Outcome::Preview(_) | Outcome::Profiles(_) => Err(unexpected_preview()),
             Outcome::Error(error) => Err(ClientError::Daemon(error)),
         }
     }
@@ -103,7 +104,7 @@ impl Client {
         match self.exchange(Request::UploadStandby(params))? {
             Outcome::Result(status) => Ok((status, None)),
             Outcome::DryRun(reply) => Ok((reply.status.clone(), Some(reply))),
-            Outcome::Preview(_) => Err(unexpected_preview()),
+            Outcome::Preview(_) | Outcome::Profiles(_) => Err(unexpected_preview()),
             Outcome::Error(error) => Err(ClientError::Daemon(error)),
         }
     }
@@ -121,7 +122,7 @@ impl Client {
         match self.exchange(Request::UploadBootAnimation(params))? {
             Outcome::Result(status) => Ok((status, None)),
             Outcome::DryRun(reply) => Ok((reply.status.clone(), Some(reply))),
-            Outcome::Preview(_) => Err(unexpected_preview()),
+            Outcome::Preview(_) | Outcome::Profiles(_) => Err(unexpected_preview()),
             Outcome::Error(error) => Err(ClientError::Daemon(error)),
         }
     }
@@ -136,9 +137,28 @@ impl Client {
         match self.exchange(Request::Preview)? {
             Outcome::Preview(reply) => Ok(reply),
             Outcome::Error(error) => Err(ClientError::Daemon(error)),
-            Outcome::Result(_) | Outcome::DryRun(_) => Err(ClientError::Protocol(
-                "daemon answered a preview request with another reply".into(),
-            )),
+            Outcome::Result(_) | Outcome::DryRun(_) | Outcome::Profiles(_) => {
+                Err(ClientError::Protocol(
+                    "daemon answered a preview request with another reply".into(),
+                ))
+            }
+        }
+    }
+
+    /// Fetches the profile list with the daemon status.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::call`]; an older daemon answers `bad_request`.
+    pub fn profiles(&mut self) -> Result<ProfilesReply, ClientError> {
+        match self.exchange(Request::ProfileList)? {
+            Outcome::Profiles(reply) => Ok(reply),
+            Outcome::Error(error) => Err(ClientError::Daemon(error)),
+            Outcome::Result(_) | Outcome::DryRun(_) | Outcome::Preview(_) => {
+                Err(ClientError::Protocol(
+                    "daemon answered a profile request with another reply".into(),
+                ))
+            }
         }
     }
 

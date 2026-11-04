@@ -123,6 +123,13 @@ impl BootPage {
         &self.stack
     }
 
+    /// Lays the editors out for the panel at rotation `step`.
+    pub fn set_rotation(&self, step: u8) {
+        for tab in &self.inner.tabs {
+            tab.source.set_rotation(step);
+        }
+    }
+
     pub fn refresh(&self) {
         self.inner.update_buttons();
     }

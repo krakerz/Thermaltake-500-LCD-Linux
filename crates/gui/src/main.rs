@@ -6,6 +6,7 @@ mod daemon;
 mod geometry;
 mod media;
 mod playback;
+mod profiles;
 mod settings;
 mod state;
 mod ui;

@@ -1,4 +1,4 @@
-//! The main window: a sidebar with the Display and Boot pages, banners, brightness and status.
+//! The main window: a sidebar with the Display and Boot pages, banners, brightness, rotation and status.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -6,13 +6,17 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use tt500_lcd_ipc::{BrightnessParams, ContentKind, DEFAULT_BRIGHTNESS, Request};
+use tt500_lcd_ipc::{
+    BrightnessParams, ContentKind, DEFAULT_BRIGHTNESS, Request, RotationParams, Status,
+};
 
 use super::area_page::AreaPage;
 use super::boot_page::BootPage;
 use super::context::{Context, weak_call};
 use super::file_source::CHOOSE_FILE;
 use super::icons::{self, icon};
+use super::profile_switcher::ProfileSwitcher;
+use super::profiles_page::ProfilesPage;
 use super::static_page::StaticPage;
 use crate::daemon::{self, Update};
 use crate::state::{Connection, START_HINT};
@@ -147,6 +151,90 @@ impl Brightness {
     }
 }
 
+/// Labels and tooltips of the rotation steps. The picture is turned on the PC: step 1 lays the
+/// content out portrait and turns it 90 degrees clockwise (so the panel is mounted turned 90
+/// degrees counter-clockwise, content reading top to bottom); step 3 is the mirror case.
+const ROTATIONS: [(&str, &str); 4] = [
+    ("0°", "Normal"),
+    ("90°", "Portrait — panel turned 90° counter-clockwise"),
+    ("180°", "Upside down"),
+    ("270°", "Portrait — panel turned 90° clockwise"),
+];
+
+/// The panel rotation step buttons (global). Cloning shares them.
+#[derive(Clone)]
+struct Rotation {
+    ctx: Rc<Context>,
+    buttons: Rc<Vec<gtk::ToggleButton>>,
+    /// Set while code (not the user) toggles a button, so its handler stays quiet.
+    syncing: Rc<Cell<bool>>,
+}
+
+impl Rotation {
+    fn new(ctx: &Rc<Context>) -> Self {
+        let buttons: Vec<gtk::ToggleButton> = ROTATIONS
+            .iter()
+            .map(|(label, tooltip)| {
+                gtk::ToggleButton::builder()
+                    .label(*label)
+                    .tooltip_text(*tooltip)
+                    .hexpand(true)
+                    .build()
+            })
+            .collect();
+        for button in &buttons[1..] {
+            button.set_group(Some(&buttons[0]));
+        }
+        buttons[0].set_active(true);
+        let this = Self {
+            ctx: Rc::clone(ctx),
+            buttons: Rc::new(buttons),
+            syncing: Rc::new(Cell::new(false)),
+        };
+        for (step, button) in this.buttons.iter().enumerate() {
+            let handler = this.clone();
+            button.connect_toggled(move |button| {
+                if button.is_active() && !handler.syncing.get() {
+                    #[expect(clippy::cast_possible_truncation, reason = "at most four buttons")]
+                    let value = step as u8;
+                    handler
+                        .ctx
+                        .send(Request::SetRotation(RotationParams { value }), "");
+                }
+            });
+        }
+        this
+    }
+
+    /// Title above a row of four linked toggle buttons.
+    fn widget(&self) -> gtk::Box {
+        let title = gtk::Label::builder().label("Rotation").xalign(0.0).build();
+        let row = gtk::Box::builder()
+            .css_classes(["linked"])
+            .homogeneous(true)
+            .build();
+        for button in self.buttons.iter() {
+            row.append(button);
+        }
+        let column = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .build();
+        column.append(&title);
+        column.append(&row);
+        column
+    }
+
+    /// Shows the daemon's step; an out-of-range value is ignored.
+    fn follow(&self, value: u8) {
+        if let Some(button) = self.buttons.get(usize::from(value)) {
+            self.syncing.set(true);
+            button.set_active(true);
+            self.syncing.set(false);
+        }
+    }
+}
+
 /// A sidebar entry: a page of the content stack and its view switcher stack.
 struct PageEntry {
     name: &'static str,
@@ -168,9 +256,18 @@ struct Shell {
     status_row: adw::ActionRow,
     status_icon: gtk::Image,
     brightness: Brightness,
+    rotation: Rotation,
+    /// The step the editors are laid out for, `None` before the first status.
+    editor_rotation: Cell<Option<u8>>,
     static_page: StaticPage,
     boot_page: BootPage,
     area_page: AreaPage,
+    profiles_page: ProfilesPage,
+    profile_switcher: ProfileSwitcher,
+    /// The profile-set revision last fetched, `None` before the first status.
+    profile_revision: Cell<Option<u64>>,
+    /// The activation counter last seen, `None` before the first status.
+    profile_activation: Cell<Option<u64>>,
 }
 
 impl Shell {
@@ -185,10 +282,13 @@ impl Shell {
             .build();
         let ctx = Context::new(window.clone(), toasts.clone());
         let brightness = Brightness::new(&ctx);
+        let rotation = Rotation::new(&ctx);
         let reset = brightness.clone();
         let static_page = StaticPage::new(&ctx, move || reset.reset());
         let boot_page = BootPage::new(&ctx);
         let area_page = AreaPage::new(&ctx);
+        let profiles_page = ProfilesPage::new(&ctx);
+        let profile_switcher = ProfileSwitcher::new(&ctx);
 
         let display_views = adw::ViewStack::new();
         display_views.add_titled_with_icon(
@@ -215,6 +315,12 @@ impl Shell {
                 title: "Boot",
                 icon: icons::POWER,
                 views: boot_page.view_stack().clone(),
+            },
+            PageEntry {
+                name: "profiles",
+                title: "Profiles",
+                icon: icons::PROFILES,
+                views: profiles_page.widget().clone(),
             },
         ];
 
@@ -281,7 +387,9 @@ impl Shell {
             .margin_start(12)
             .margin_end(12)
             .build();
+        bottom.append(&profile_switcher.widget());
         bottom.append(&brightness.widget());
+        bottom.append(&rotation.widget());
         bottom.append(&status_list);
         let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         sidebar_box.append(&sidebar_list);
@@ -321,9 +429,15 @@ impl Shell {
             status_row,
             status_icon,
             brightness,
+            rotation,
+            editor_rotation: Cell::new(None),
             static_page,
             boot_page,
             area_page,
+            profiles_page,
+            profile_switcher,
+            profile_revision: Cell::new(None),
+            profile_activation: Cell::new(None),
         });
         let weak = Rc::downgrade(&shell);
         let select = weak_call(&weak, |shell, index: i32| shell.select_page(index));
@@ -455,14 +569,49 @@ impl Shell {
         self.status_icon.set_icon_name(Some(icon(icon_name)));
 
         match &status {
-            Some(status) => self.brightness.follow(status.brightness),
+            Some(status) => {
+                self.brightness.follow(status.brightness);
+                if let Some(step) = status.rotation {
+                    self.rotation.follow(step);
+                    if self.editor_rotation.replace(Some(step)) != Some(step) {
+                        self.static_page.set_rotation(step);
+                        self.boot_page.set_rotation(step);
+                        self.area_page.set_rotation(step);
+                    }
+                }
+            }
             None => self.brightness.update_label(),
         }
+        self.refresh_profiles(status.as_ref());
         self.static_page.refresh(status.as_ref());
         self.boot_page.refresh();
         if self.area_page.refresh(status.as_ref()) {
             self.show_area();
         }
+    }
+
+    /// Follows the profile status: refetches the list when the set changed, makes the editors
+    /// re-adopt the daemon's content after an activation.
+    fn refresh_profiles(&self, status: Option<&Status>) {
+        let profile = status.and_then(|status| status.profile.as_ref());
+        if let Some(profile) = profile {
+            if self.profile_revision.get() != Some(profile.revision) {
+                self.profile_revision.set(Some(profile.revision));
+                let page = self.profiles_page.clone();
+                let switcher = self.profile_switcher.clone();
+                self.ctx.reload_profiles(move || {
+                    page.set_profiles();
+                    switcher.set_profiles();
+                });
+            }
+            let seen = self.profile_activation.replace(Some(profile.activation));
+            if seen.is_some_and(|seen| profile.activation > seen) {
+                self.static_page.readopt();
+                self.area_page.readopt();
+            }
+        }
+        self.profiles_page.refresh(status);
+        self.profile_switcher.follow(profile);
     }
 
     /// Display > Area, when the daemon already streams a live source.

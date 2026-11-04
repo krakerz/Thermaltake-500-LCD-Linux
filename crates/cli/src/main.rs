@@ -2,6 +2,7 @@
 
 mod cli;
 mod format;
+mod profile;
 
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -12,8 +13,8 @@ use anyhow::Context;
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use tt500_lcd_ipc::{
     BrightnessParams, Client, ClientError, DesktopSpec, DryRunReply, IPC_VERSION, LiveSource,
-    Request, ShowLiveParams, ShowParams, Status, UploadBootAnimationParams, UploadStandbyParams,
-    socket_path,
+    Request, RotationParams, ShowLiveParams, ShowParams, Status, UploadBootAnimationParams,
+    UploadStandbyParams, socket_path,
 };
 
 use tt500_lcd_setup::SystemRunner;
@@ -147,6 +148,7 @@ fn run(command: Command) -> Result<(), anyhow::Error> {
                 yes,
             );
         }
+        Command::Profile { action } => return profile::run(action),
         Command::Watch { json } => return watch(json),
         Command::Service { action } => return service(action),
         Command::Autostart { action } => return autostart(action),
@@ -154,6 +156,7 @@ fn run(command: Command) -> Result<(), anyhow::Error> {
         Command::Brightness { value } => {
             (Request::SetBrightness(BrightnessParams { value }), false)
         }
+        Command::Rotation { value } => (Request::SetRotation(RotationParams { value }), false),
         Command::Status { json } => (Request::Status, json),
     };
 
@@ -345,7 +348,7 @@ fn watch(json: bool) -> Result<(), anyhow::Error> {
     }
 }
 
-fn describe(err: &ClientError, socket: &Path) -> anyhow::Error {
+pub(crate) fn describe(err: &ClientError, socket: &Path) -> anyhow::Error {
     match err {
         ClientError::Connect { source, .. } => anyhow::anyhow!(
             "cannot reach tt500-lcdd at {}: {source}\n{START_HINT}",

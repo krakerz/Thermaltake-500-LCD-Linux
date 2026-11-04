@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use tt500_lcd_protocol::StandbyImage;
+use tt500_lcd_protocol::{Rotation, StandbyImage};
 
 /// File name of the raw packet dump.
 const DUMP_FILE: &str = "standby-dryrun.bin";
@@ -23,13 +23,18 @@ pub struct DryRunFiles {
 
 /// Writes the packets of `image` (raw, back to back) and a text summary into `dir`.
 /// Nothing is sent to the panel.
-pub fn write_dry_run(dir: &Path, image: &StandbyImage) -> io::Result<DryRunFiles> {
+pub fn write_dry_run(
+    dir: &Path,
+    image: &StandbyImage,
+    rotation: Rotation,
+) -> io::Result<DryRunFiles> {
     fs::create_dir_all(dir)?;
     let packets = image.packets();
     let mut raw = Vec::with_capacity(packets.len() * 1024);
     let mut summary = String::new();
     let per_slot = packets.len() / 2;
     let _ = writeln!(summary, "standby dry run: nothing was sent to the panel");
+    let _ = writeln!(summary, "rotation: step {}", rotation.get());
     let _ = writeln!(summary, "jpeg bytes: {}", image.byte_len());
     let _ = writeln!(
         summary,
@@ -69,7 +74,7 @@ mod tests {
         jpeg.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1, 0xff, 0xd9]);
         let image = StandbyImage::from_jpeg(jpeg).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let files = write_dry_run(dir.path(), &image).unwrap();
+        let files = write_dry_run(dir.path(), &image, Rotation::default()).unwrap();
         let raw = fs::read(&files.packets).unwrap();
         let want: Vec<u8> = image
             .packets()

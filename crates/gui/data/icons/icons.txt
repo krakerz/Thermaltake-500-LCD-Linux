@@ -16,3 +16,5 @@ tt5-warning-symbolic       triangle-alert
 tt5-display-symbolic       monitor
 tt5-power-symbolic         power
 tt5-area-symbolic          monitor
+tt5-profiles-symbolic      layers
+tt5-handle-symbolic        grip-vertical

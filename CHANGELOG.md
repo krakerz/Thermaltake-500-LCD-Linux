@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Profiles: named display setups (source, framing, fps, steady, brightness, rotation) kept by the daemon in `profiles.toml`, switched by hand or by triggers: times of day (optionally on chosen weekdays) and "while a process runs". `tt500-lcd profile list|save|activate|rename|delete|move|trigger ...`, a GUI Profiles page (drag to reorder, trigger editor) and a profile switcher in the sidebar footer; the daemon requests are `profile_list`, `profile_save`, `profile_rename`, `profile_delete`, `profile_activate`, `profile_set_triggers` and `profile_reorder`, and `status` reports the active profile. A profile never changes the boot animation or the standby image
+- Profiles: time-range triggers ("active from 22:00 to 06:00", optional weekdays by start day, may wrap midnight; `trigger add-range|remove-range`) that outrank schedule times; a built-in, undeletable Default profile (the fallback when no trigger applies) with `profile reset` / `profile_reset` and a Reset to Defaults item in the GUI; status marks a hand-changed profile as modified ("(changed)"). Clients older than this change cannot parse the new reason kinds
+- Panel rotation: `tt500-lcd rotation <0|1|2|3>`, a Rotation control in the GUI sidebar and the daemon's `set_rotation` request (the step is stored and re-applied after every start-up; `status` reports it). The panel ignores `03 1d NN` (still sent, as TT RGB Plus does), so the daemon rotates the picture itself before encoding, like TT RGB Plus: 2 turns it 180°, 1 and 3 are portrait modes that lay the content out on a 128×480 canvas and turn it 90° clockwise / counter-clockwise (for a panel mounted vertically). It applies to images, animations, videos and live sources, to the standby image and boot animation, and re-renders what is showing when changed; the GUI crop editors switch to the portrait shape and the sidebar buttons read 0° / 90° / 180° / 270°
 - `tt500-lcd service install|uninstall|status` and `tt500-lcd autostart on|off|status`, and a GUI Preferences dialog (Main menu), to run the daemon as a systemd user service and start the GUI at login
 - GUI: Area tab streams a monitor or a virtual desktop running your own commands to the panel, with the same crop editor
 - Steady frames for live sources: a frame that changed since the last capture is shown only once the next capture matches it (or after 250 ms), so a terminal caught mid-redraw no longer flickers on the panel; `--steady` / `--no-steady` on `show-desktop` and `show-screen`, a switch on the GUI Area tab; on by default for the virtual desktop, off for a screen (`steady` in the daemon's `show_live` request)
@@ -32,6 +35,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Profiles: the switcher has no "none" entry, and manual `show`/`clear` keep the active profile marked as changed and fall back to Default instead of clearing the marker
 - GUI: sidebar with Display and Boot pages; the standby image and the boot animation (Boot page, one tab each) have their own file picker and crop editor, and brightness and panel status sit at the bottom of the sidebar; a placeholder Area tab is next to Static
 - Brightness also applies while nothing is shown (the daemon opens the panel briefly)
 - GUI: Clear Panel also resets the file, framing, frame rate and brightness (100); `tt500-lcd clear` keeps the brightness

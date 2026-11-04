@@ -109,6 +109,17 @@ impl StaticPage {
         self.inner.file.stop();
     }
 
+    /// Reloads the daemon's content into the editor (after a profile was activated).
+    pub fn readopt(&self) {
+        self.inner.file.drop_file();
+        *self.inner.auto_loaded.borrow_mut() = None;
+    }
+
+    /// Lays the editor out for the panel at rotation `step`.
+    pub fn set_rotation(&self, step: u8) {
+        self.inner.file.set_rotation(step);
+    }
+
     /// Redraws what depends on the daemon's status.
     pub fn refresh(&self, status: Option<&Status>) {
         let inner = &self.inner;

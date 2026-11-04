@@ -144,6 +144,11 @@ impl FileSource {
         self.inner.panel.framed()
     }
 
+    /// Lays the editor out for the panel at rotation `step`.
+    pub fn set_rotation(&self, step: u8) {
+        self.inner.panel.set_rotation(step);
+    }
+
     /// Takes framing and fps from the daemon's content when it shows the file just opened.
     pub fn follow_daemon(&self) {
         self.inner.follows_daemon.set(true);

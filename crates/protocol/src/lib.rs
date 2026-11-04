@@ -24,6 +24,7 @@ pub use frame::{Frame, FrameError, MAX_FRAME_BYTES};
 pub use hid::{Discovery, HidTransport, OpenError};
 pub use packet::{
     Brightness, BrightnessError, FeatureCommand, FeatureQuery, FeatureReply, OutputPacket,
+    Rotation, RotationError,
 };
 pub use session::{Panel, PanelInfo, SessionError, StatusReply};
 pub use standby::{MAX_STANDBY_JPEG_BYTES, StandbyImage};

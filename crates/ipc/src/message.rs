@@ -6,6 +6,11 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::profile::{
+    ProfileNameParams, ProfileRenameParams, ProfileReorderParams, ProfileSaveParams, ProfileStatus,
+    ProfileTriggersParams, ProfilesReply,
+};
+
 /// A client request with its correlation id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestEnvelope {
@@ -29,6 +34,8 @@ pub enum Request {
     Clear,
     /// Set the panel brightness.
     SetBrightness(BrightnessParams),
+    /// Set the panel rotation step (as sent by TT RGB Plus).
+    SetRotation(RotationParams),
     /// Reply with the current [`Status`], then push an [`Event::Status`] on every change.
     ///
     /// The connection is event-only afterwards: further input is ignored, and closing the
@@ -44,6 +51,22 @@ pub enum Request {
     ShowLive(ShowLiveParams),
     /// Write the latest full live-source frame to a file (crop-editor preview).
     Preview,
+    /// List the profiles.
+    ProfileList,
+    /// Save a profile: from the given spec, or a snapshot of the current content.
+    ProfileSave(ProfileSaveParams),
+    /// Rename a profile.
+    ProfileRename(ProfileRenameParams),
+    /// Delete a profile.
+    ProfileDelete(ProfileNameParams),
+    /// Switch to a profile.
+    ProfileActivate(ProfileNameParams),
+    /// Replace a profile's triggers.
+    ProfileSetTriggers(ProfileTriggersParams),
+    /// Set the profile order; `names` must list every profile exactly once.
+    ProfileReorder(ProfileReorderParams),
+    /// Restore the built-in Default profile to its factory state.
+    ProfileReset(ProfileNameParams),
 }
 
 /// Parameters of [`Request::UploadBootAnimation`].
@@ -150,6 +173,21 @@ pub const DESKTOP_DEFAULT_SCALE: u8 = 2;
 /// Most commands a virtual desktop runs.
 pub const DESKTOP_MAX_COMMANDS: usize = 8;
 
+/// Narrowest accepted desktop, in physical pixels.
+pub const DESKTOP_MIN_WIDTH: u32 = 240;
+/// Widest accepted desktop, in physical pixels.
+pub const DESKTOP_MAX_WIDTH: u32 = 3840;
+/// Shortest accepted desktop, in physical pixels.
+pub const DESKTOP_MIN_HEIGHT: u32 = 64;
+/// Tallest accepted desktop, in physical pixels.
+pub const DESKTOP_MAX_HEIGHT: u32 = 2160;
+/// Smallest accepted logical (size / scale) width.
+pub const DESKTOP_MIN_LOGICAL_WIDTH: u32 = 120;
+/// Smallest accepted logical (size / scale) height.
+pub const DESKTOP_MIN_LOGICAL_HEIGHT: u32 = 32;
+/// Largest accepted output scale.
+pub const DESKTOP_MAX_SCALE: u8 = 3;
+
 /// Longest accepted command, in bytes.
 const DESKTOP_MAX_COMMAND_BYTES: usize = 1024;
 
@@ -193,21 +231,36 @@ impl DesktopSpec {
             }
         }
         let Size { width, height } = self.size;
-        if !(64..=3840).contains(&width) || !(32..=2160).contains(&height) {
+        if !(DESKTOP_MIN_WIDTH..=DESKTOP_MAX_WIDTH).contains(&width)
+            || !(DESKTOP_MIN_HEIGHT..=DESKTOP_MAX_HEIGHT).contains(&height)
+        {
             return Err(format!(
-                "desktop size {width}x{height} out of range (64..=3840 x 32..=2160)"
+                "desktop size {width}x{height} out of range \
+                 ({DESKTOP_MIN_WIDTH}..={DESKTOP_MAX_WIDTH} x {DESKTOP_MIN_HEIGHT}..={DESKTOP_MAX_HEIGHT})"
             ));
         }
         if width % 2 != 0 || height % 2 != 0 {
             return Err(format!("desktop size {width}x{height} must be even"));
         }
-        if !(1..=3).contains(&self.scale) {
-            return Err(format!("scale {} out of range 1..=3", self.scale));
+        if !(1..=DESKTOP_MAX_SCALE).contains(&self.scale) {
+            return Err(format!(
+                "scale {} out of range 1..={DESKTOP_MAX_SCALE}",
+                self.scale
+            ));
         }
         let scale = u32::from(self.scale);
         if width % scale != 0 || height % scale != 0 {
             return Err(format!(
                 "desktop size {width}x{height} is not divisible by scale {scale}"
+            ));
+        }
+        if width / scale < DESKTOP_MIN_LOGICAL_WIDTH || height / scale < DESKTOP_MIN_LOGICAL_HEIGHT
+        {
+            return Err(format!(
+                "logical desktop size {}x{} is below \
+                 {DESKTOP_MIN_LOGICAL_WIDTH}x{DESKTOP_MIN_LOGICAL_HEIGHT}",
+                width / scale,
+                height / scale
             ));
         }
         Ok(())
@@ -220,6 +273,16 @@ impl DesktopSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrightnessParams {
     /// Brightness in percent.
+    pub value: u8,
+}
+
+/// Parameters of [`Request::SetRotation`].
+///
+/// Plain `u8` on the wire; the daemon validates 0..=3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotationParams {
+    /// Rotation step: 0 = normal, 1 = portrait turned 90 degrees clockwise, 2 = 180 degrees,
+    /// 3 = portrait turned 90 degrees counter-clockwise (the daemon renders the picture so).
     pub value: u8,
 }
 
@@ -353,6 +416,8 @@ pub enum Outcome {
     DryRun(DryRunReply),
     /// Reply to [`Request::Preview`].
     Preview(PreviewReply),
+    /// Reply to [`Request::ProfileList`].
+    Profiles(ProfilesReply),
 }
 
 /// Reply to [`Request::Preview`].
@@ -406,9 +471,15 @@ pub struct Status {
     pub content: Option<ContentInfo>,
     /// Stored brightness setting, 0..=100, also when idle.
     pub brightness: u8,
+    /// Stored rotation step, 0..=3; absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<u8>,
     /// Why the stored content could not be restored at start-up (e.g. a moved video).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_error: Option<String>,
+    /// Profiles, absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileStatus>,
 }
 
 /// Panel connection state.
@@ -541,6 +612,7 @@ impl fmt::Display for ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::{ActiveProfile, ProfileReason, RangeEntry, TimeOfDay};
 
     fn status() -> Status {
         Status {
@@ -551,7 +623,9 @@ mod tests {
             },
             content: None,
             brightness: 100,
+            rotation: None,
             content_error: None,
+            profile: None,
         }
     }
 
@@ -678,9 +752,30 @@ mod tests {
         ));
         assert!(bad(&|s| s.commands = vec!["  ".into()]));
         assert!(bad(&|s| s.commands = vec!["x".repeat(1025)]));
-        assert!(bad(&|s| s.size.width = 62));
+        assert!(bad(&|s| s.size.width = 238));
         assert!(bad(&|s| s.size.width = 3842));
-        assert!(bad(&|s| s.size.height = 30));
+        assert!(bad(&|s| s.size.height = 62));
+        assert!(bad(&|s| {
+            s.size = Size {
+                width: 354,
+                height: 96,
+            };
+            s.scale = 3;
+        }));
+        assert!(!bad(&|s| {
+            s.size = Size {
+                width: 960,
+                height: 512,
+            };
+            s.scale = 1;
+        }));
+        assert!(!bad(&|s| {
+            s.size = Size {
+                width: 240,
+                height: 64,
+            };
+            s.scale = 2;
+        }));
         assert!(bad(&|s| s.size.height = 2162));
         assert!(bad(&|s| s.size.width = 961));
         assert!(bad(&|s| s.scale = 0));
@@ -748,6 +843,241 @@ mod tests {
         let json = serde_json::to_string(&want).unwrap();
         assert!(json.contains(r#""content_error":"clip.mkv not found""#));
         assert_eq!(serde_json::from_str::<Status>(&json).unwrap(), want);
+    }
+
+    #[test]
+    fn profile_requests_have_stable_json() {
+        use crate::profile::{
+            ProfileSource, ProfileSpec, ScheduleEntry, TimeOfDay, Triggers, Weekday,
+        };
+        let cases: Vec<(&str, RequestEnvelope)> = vec![
+            (
+                r#"{"id":3,"method":"profile_list"}"#,
+                RequestEnvelope {
+                    id: 3,
+                    request: Request::ProfileList,
+                },
+            ),
+            (
+                r#"{"id":4,"method":"profile_activate","params":{"name":"Night"}}"#,
+                RequestEnvelope {
+                    id: 4,
+                    request: Request::ProfileActivate(ProfileNameParams {
+                        name: "Night".into(),
+                    }),
+                },
+            ),
+            (
+                r#"{"id":5,"method":"profile_save","params":{"name":"Night"}}"#,
+                RequestEnvelope {
+                    id: 5,
+                    request: Request::ProfileSave(ProfileSaveParams {
+                        name: "Night".into(),
+                        spec: None,
+                    }),
+                },
+            ),
+            (
+                r#"{"id":5,"method":"profile_save","params":{"name":"Night","spec":{"fit":"cover","brightness":10,"source":{"type":"static","path":"/tmp/a.png"}}}}"#,
+                RequestEnvelope {
+                    id: 5,
+                    request: Request::ProfileSave(ProfileSaveParams {
+                        name: "Night".into(),
+                        spec: Some(ProfileSpec {
+                            fit: Fit::Cover,
+                            brightness: Some(10),
+                            source: Some(ProfileSource::Static {
+                                path: "/tmp/a.png".into(),
+                            }),
+                            ..ProfileSpec::default()
+                        }),
+                    }),
+                },
+            ),
+            (
+                r#"{"id":6,"method":"profile_rename","params":{"from":"a","to":"b"}}"#,
+                RequestEnvelope {
+                    id: 6,
+                    request: Request::ProfileRename(ProfileRenameParams {
+                        from: "a".into(),
+                        to: "b".into(),
+                    }),
+                },
+            ),
+            (
+                r#"{"id":7,"method":"profile_delete","params":{"name":"a"}}"#,
+                RequestEnvelope {
+                    id: 7,
+                    request: Request::ProfileDelete(ProfileNameParams { name: "a".into() }),
+                },
+            ),
+            (
+                r#"{"id":9,"method":"profile_reorder","params":{"names":["b","a"]}}"#,
+                RequestEnvelope {
+                    id: 9,
+                    request: Request::ProfileReorder(ProfileReorderParams {
+                        names: vec!["b".into(), "a".into()],
+                    }),
+                },
+            ),
+            (
+                r#"{"id":8,"method":"profile_set_triggers","params":{"name":"Night","triggers":{"processes":["game.exe"],"schedule":[{"time":"22:00","days":["mon","tue"]},{"time":"07:30"}]}}}"#,
+                RequestEnvelope {
+                    id: 8,
+                    request: Request::ProfileSetTriggers(ProfileTriggersParams {
+                        name: "Night".into(),
+                        triggers: Triggers {
+                            processes: vec!["game.exe".into()],
+                            schedule: vec![
+                                ScheduleEntry {
+                                    time: TimeOfDay::new(22, 0).unwrap(),
+                                    days: vec![Weekday::Mon, Weekday::Tue],
+                                },
+                                ScheduleEntry {
+                                    time: TimeOfDay::new(7, 30).unwrap(),
+                                    days: Vec::new(),
+                                },
+                            ],
+                            ranges: Vec::new(),
+                        },
+                    }),
+                },
+            ),
+            (
+                r#"{"id":10,"method":"profile_reset","params":{"name":"Default"}}"#,
+                RequestEnvelope {
+                    id: 10,
+                    request: Request::ProfileReset(ProfileNameParams {
+                        name: "Default".into(),
+                    }),
+                },
+            ),
+            (
+                r#"{"id":11,"method":"profile_set_triggers","params":{"name":"Night","triggers":{"ranges":[{"start":"22:00","end":"06:00","days":["fri"]}]}}}"#,
+                RequestEnvelope {
+                    id: 11,
+                    request: Request::ProfileSetTriggers(ProfileTriggersParams {
+                        name: "Night".into(),
+                        triggers: Triggers {
+                            processes: Vec::new(),
+                            schedule: Vec::new(),
+                            ranges: vec![RangeEntry {
+                                start: TimeOfDay::new(22, 0).unwrap(),
+                                end: TimeOfDay::new(6, 0).unwrap(),
+                                days: vec![Weekday::Fri],
+                            }],
+                        },
+                    }),
+                },
+            ),
+        ];
+        for (json, want) in &cases {
+            check_request(json, want);
+        }
+    }
+
+    #[test]
+    fn status_without_profile_round_trips_byte_identical() {
+        let json = serde_json::to_string(&status()).unwrap();
+        assert!(!json.contains("profile"));
+        let got: Status = serde_json::from_str(&json).unwrap();
+        assert_eq!(got.profile, None);
+        assert_eq!(serde_json::to_string(&got).unwrap(), json);
+    }
+
+    #[test]
+    fn status_with_profile_round_trips() {
+        let json = r#"{"daemon_version":"0.1.0","ipc_version":1,"device":{"state":"idle"},"content":null,"brightness":100,"profile":{"revision":3,"activation":2,"active":{"name":"Night","reason":{"kind":"schedule"}}}}"#;
+        let got: Status = serde_json::from_str(json).unwrap();
+        let profile = got.profile.as_ref().expect("profile parsed");
+        assert_eq!(profile.revision, 3);
+        assert_eq!(profile.activation, 2);
+        assert_eq!(
+            profile.active,
+            Some(ActiveProfile {
+                name: "Night".into(),
+                reason: ProfileReason::Schedule,
+                modified: false,
+            })
+        );
+        assert_eq!(serde_json::to_string(&got).unwrap(), json);
+
+        let json = r#"{"daemon_version":"0.1.0","ipc_version":1,"device":{"state":"idle"},"content":null,"brightness":100,"profile":{"revision":1,"activation":1,"active":{"name":"Game","reason":{"kind":"process","process":"game.exe"}},"problem":"clip.mkv not found"}}"#;
+        let got: Status = serde_json::from_str(json).unwrap();
+        let profile = got.profile.as_ref().expect("profile parsed");
+        assert_eq!(
+            profile.active.as_ref().map(|a| &a.reason),
+            Some(&ProfileReason::Process {
+                process: "game.exe".into()
+            })
+        );
+        assert_eq!(profile.problem.as_deref(), Some("clip.mkv not found"));
+        assert_eq!(serde_json::to_string(&got).unwrap(), json);
+    }
+
+    #[test]
+    fn status_v2_reasons_round_trip() {
+        let json = r#"{"daemon_version":"0.1.0","ipc_version":1,"device":{"state":"idle"},"content":null,"brightness":100,"profile":{"revision":1,"activation":1,"active":{"name":"Default","reason":{"kind":"fallback"},"modified":true}}}"#;
+        let got: Status = serde_json::from_str(json).unwrap();
+        let active = got
+            .profile
+            .as_ref()
+            .and_then(|p| p.active.as_ref())
+            .unwrap();
+        assert_eq!(active.reason, ProfileReason::Fallback);
+        assert!(active.modified);
+        assert_eq!(serde_json::to_string(&got).unwrap(), json);
+
+        let json = r#"{"name":"Night","reason":{"kind":"range","start":"22:00","end":"06:00"}}"#;
+        let got: ActiveProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            got.reason,
+            ProfileReason::Range {
+                start: TimeOfDay::new(22, 0).unwrap(),
+                end: TimeOfDay::new(6, 0).unwrap(),
+            }
+        );
+        assert!(!got.modified);
+        assert_eq!(serde_json::to_string(&got).unwrap(), json);
+
+        let got: ActiveProfile =
+            serde_json::from_str(r#"{"name":"x","reason":{"kind":"lunar"}}"#).unwrap();
+        assert_eq!(got.reason, ProfileReason::Unknown);
+    }
+
+    #[test]
+    fn clear_source_golden() {
+        use crate::profile::ProfileSource;
+        let json = r#"{"type":"clear"}"#;
+        let got: ProfileSource = serde_json::from_str(json).unwrap();
+        assert_eq!(got, ProfileSource::Clear);
+        assert_eq!(serde_json::to_string(&got).unwrap(), json);
+    }
+
+    #[test]
+    fn profiles_outcome_round_trips() {
+        use crate::profile::{Profile, ProfileSpec, Triggers};
+        let want = ServerMessage::Response(Response {
+            id: 10,
+            outcome: Outcome::Profiles(ProfilesReply {
+                profiles: vec![Profile {
+                    name: "Dim".into(),
+                    builtin: None,
+                    spec: ProfileSpec {
+                        brightness: Some(5),
+                        ..ProfileSpec::default()
+                    },
+                    triggers: Triggers::default(),
+                }],
+                status: status(),
+            }),
+        });
+        let json = serde_json::to_string(&want).unwrap();
+        assert!(
+            json.starts_with(r#"{"id":10,"profiles":{"profiles":["#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), want);
     }
 
     #[test]
@@ -1006,6 +1336,31 @@ mod tests {
                 request: Request::SetBrightness(BrightnessParams { value: 40 }),
             },
         );
+    }
+
+    #[test]
+    fn set_rotation_request() {
+        check_request(
+            r#"{"id":5,"method":"set_rotation","params":{"value":2}}"#,
+            &RequestEnvelope {
+                id: 5,
+                request: Request::SetRotation(RotationParams { value: 2 }),
+            },
+        );
+    }
+
+    #[test]
+    fn status_rotation_is_omitted_when_none_and_round_trips() {
+        let mut s = status();
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("rotation"), "{json}");
+        s.rotation = Some(3);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""brightness":100,"rotation":3"#), "{json}");
+        assert_eq!(serde_json::from_str::<Status>(&json).unwrap(), s);
+        // A status from an older daemon has no rotation field.
+        let old = r#"{"daemon_version":"0.1.0","ipc_version":1,"device":{"state":"idle"},"content":null,"brightness":5}"#;
+        assert_eq!(serde_json::from_str::<Status>(old).unwrap().rotation, None);
     }
 
     #[test]

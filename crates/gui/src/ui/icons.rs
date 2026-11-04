@@ -41,6 +41,10 @@ pub const AREA: &str = "tt5-area-symbolic";
 pub const POWER: &str = "tt5-power-symbolic";
 /// Warning.
 pub const WARNING: &str = "tt5-warning-symbolic";
+/// The Profiles page.
+pub const PROFILES: &str = "tt5-profiles-symbolic";
+/// Drag handle of a reorderable row.
+pub const HANDLE: &str = "tt5-handle-symbolic";
 
 /// Each icon with the Adwaita icon used while its SVG is not embedded.
 const FALLBACKS: &[(&str, &str)] = &[
@@ -61,6 +65,8 @@ const FALLBACKS: &[(&str, &str)] = &[
     (AREA, "video-display-symbolic"),
     (POWER, "system-shutdown-symbolic"),
     (WARNING, "dialog-warning-symbolic"),
+    (PROFILES, "view-list-symbolic"),
+    (HANDLE, "list-drag-handle-symbolic"),
 ];
 
 const APP_ICON_NAME: &str = "io.github.krakerz.Tt500Lcd";
@@ -114,7 +120,7 @@ mod tests {
 
     const ALL: &[&str] = &[
         OPEN, CLEAR, APPLY, BRIGHTNESS, FPS, CROP, ZOOM_IN, ZOOM_OUT, RESET, REMOVE, PANEL,
-        PANEL_OFF, SEARCHING, DISPLAY, AREA, POWER, WARNING,
+        PANEL_OFF, SEARCHING, DISPLAY, AREA, POWER, WARNING, PROFILES, HANDLE,
     ];
 
     #[test]

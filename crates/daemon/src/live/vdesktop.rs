@@ -10,10 +10,12 @@ use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use tt500_lcd_ipc::DesktopSpec;
 
 /// Refresh rate of the headless output; the capture rate is chosen by the worker.
@@ -38,6 +40,9 @@ const EXIT_NOT_FOUND: i32 = 127;
 const CLIENT_GRACE: Duration = Duration::from_secs(1);
 /// Grace period for sway, which removes its sockets on SIGTERM.
 const SWAY_GRACE: Duration = Duration::from_secs(2);
+
+/// Grace period between SIGTERM and SIGKILL for a leftover process of an earlier daemon.
+const LEFTOVER_GRACE: Duration = Duration::from_secs(2);
 
 /// Environment variables that would make sway nest into the host session.
 const HOST_SESSION_VARS: [&str; 3] = ["WAYLAND_DISPLAY", "DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE"];
@@ -136,16 +141,60 @@ fn failures_after_exit(failures: u32, uptime: Duration) -> u32 {
     }
 }
 
-/// Forwards a child's output to the log, one debug event per line.
-fn log_output(stream: impl Read + Send + 'static, label: String) {
+/// Longest stderr line kept for a problem message, in characters.
+const STDERR_TAIL_CHARS: usize = 160;
+/// How long an exited client's stderr reader gets to deliver its last line.
+const STDERR_DRAIN_WAIT: Duration = Duration::from_millis(200);
+
+/// The last non-empty stderr line of a child, filled by its reader thread.
+#[derive(Debug, Default)]
+struct StderrTail {
+    line: Mutex<String>,
+    /// The reader reached the end of the stream.
+    done: AtomicBool,
+}
+
+impl StderrTail {
+    fn record(&self, line: &str) {
+        let line = line.trim();
+        if !line.is_empty() {
+            *self.line.lock().expect("lock poisoned") =
+                line.chars().take(STDERR_TAIL_CHARS).collect();
+        }
+    }
+
+    /// The kept line, after giving the reader a moment to finish.
+    fn get(&self) -> Option<String> {
+        let deadline = Instant::now() + STDERR_DRAIN_WAIT;
+        while !self.done.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let line = self.line.lock().expect("lock poisoned");
+        (!line.is_empty()).then(|| line.clone())
+    }
+}
+
+/// Forwards a child's output to the log, one debug event per line, and keeps the last
+/// non-empty line in `tail` when given.
+fn log_output(stream: impl Read + Send + 'static, label: String, tail: Option<Arc<StderrTail>>) {
     thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
             tracing::debug!("{label}: {line}");
+            if let Some(tail) = &tail {
+                tail.record(&line);
+            }
+        }
+        if let Some(tail) = &tail {
+            tail.done.store(true, Ordering::SeqCst);
         }
     });
 }
 
-fn spawn_logged(command: &mut Command, label: &str) -> std::io::Result<Child> {
+fn spawn_logged(
+    command: &mut Command,
+    label: &str,
+    stderr_tail: Option<Arc<StderrTail>>,
+) -> std::io::Result<Child> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -153,10 +202,10 @@ fn spawn_logged(command: &mut Command, label: &str) -> std::io::Result<Child> {
         .process_group(0);
     let mut child = command.spawn()?;
     if let Some(out) = child.stdout.take() {
-        log_output(out, label.to_owned());
+        log_output(out, label.to_owned(), None);
     }
     if let Some(err) = child.stderr.take() {
-        log_output(err, label.to_owned());
+        log_output(err, label.to_owned(), stderr_tail);
     }
     Ok(child)
 }
@@ -184,6 +233,158 @@ fn stop_group(child: &mut Child, grace: Duration) {
     let _ = child.wait();
 }
 
+/// Whether `program` is an executable file on `PATH`.
+fn in_path(program: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            fs::metadata(dir.join(program))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+fn setpriv_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let found = in_path("setpriv");
+        if !found {
+            tracing::debug!("setpriv not found: children outlive a killed daemon");
+        }
+        found
+    })
+}
+
+/// A command that runs `program` and that the kernel terminates (SIGTERM) when the daemon
+/// dies, even by SIGKILL, via `setpriv --pdeathsig`. Falls back to a plain command when
+/// `setpriv` or `program` is missing from `PATH` (so a missing program still fails at spawn).
+///
+/// The signal is tied to the *thread* that spawns the child, not the process: spawn only
+/// from a thread that lives as long as the child is wanted. The virtual desktop's capture
+/// thread does, because it owns the desktop and its drop is what stops the children.
+fn guarded_command(program: &str) -> Command {
+    if setpriv_available() && in_path(program) {
+        let mut command = Command::new("setpriv");
+        command.args(["--pdeathsig", "TERM", "--", program]);
+        command
+    } else {
+        Command::new(program)
+    }
+}
+
+/// `live_dir/desktop-` as bytes: a byte prefix, since the run dir name continues after it.
+fn desktop_prefix(live_dir: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut prefix = live_dir.as_os_str().as_bytes().to_vec();
+    prefix.extend_from_slice(b"/desktop-");
+    prefix
+}
+
+/// Like [`guarded_command`] for sway. The `sway` binary may carry file capabilities (Arch:
+/// `cap_sys_nice`), and executing such a binary clears the parent-death signal, so a
+/// guarded `sh` supervises it instead: the shell gets the signal and forwards it to sway.
+/// The command's program is `setpriv` (or plain `sway`); its arguments follow `sway`.
+fn guarded_sway() -> Command {
+    const SUPERVISE: &str = r#"trap 'kill "$p"' TERM; "$@" & p=$!; wait "$p"; s=$?; if [ "$s" -gt 128 ]; then wait "$p"; s=$?; fi; exit "$s""#;
+    if setpriv_available() && in_path("sway") {
+        let mut command = guarded_command("sh");
+        command.args(["-c", SUPERVISE, "sh", "sway"]);
+        command
+    } else {
+        Command::new("sway")
+    }
+}
+
+/// Whether `argv` (a split `/proc/<pid>/cmdline`) is a sway started by a daemon with the
+/// run dir `live_dir`: the program is `sway` and its `--config` points into `live_dir/desktop-*`.
+fn is_leftover_sway(argv: &[&[u8]], live_dir: &Path) -> bool {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let prefix = desktop_prefix(live_dir);
+    let is_sway = argv.first().is_some_and(|arg| {
+        Path::new(OsStr::from_bytes(arg)).file_name() == Some(OsStr::new("sway"))
+    });
+    is_sway && argv.iter().skip(1).any(|arg| arg.starts_with(&prefix))
+}
+
+/// Whether a `/proc/<pid>/environ` (NUL-separated) has a `SWAYSOCK` inside `live_dir/desktop-*`:
+/// a desktop command (or sway) of a daemon that is gone.
+fn has_leftover_swaysock(environ: &[u8], live_dir: &Path) -> bool {
+    let prefix = desktop_prefix(live_dir);
+    environ.split(|&b| b == 0).any(|var| {
+        var.strip_prefix(b"SWAYSOCK=")
+            .is_some_and(|v| v.starts_with(&prefix))
+    })
+}
+
+/// Pids of leftover processes of an earlier daemon under `live_dir` (never this process).
+fn find_leftovers(live_dir: &Path) -> Vec<Pid> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let own = std::process::id();
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own {
+            continue;
+        }
+        let proc = entry.path();
+        let cmdline = fs::read(proc.join("cmdline")).unwrap_or_default();
+        let argv: Vec<&[u8]> = cmdline.split(|&b| b == 0).collect();
+        let ours = is_leftover_sway(&argv, live_dir)
+            || fs::read(proc.join("environ"))
+                .is_ok_and(|environ| has_leftover_swaysock(&environ, live_dir));
+        if ours && let Some(pid) = i32::try_from(pid).ok().and_then(Pid::from_raw) {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+/// Cleans up after a daemon that died without running its destructors: terminates a sway (and
+/// the commands started on it) still running from an earlier daemon, then removes the stale
+/// `desktop-*` run dirs under `live_dir`. Only processes whose command line or `SWAYSOCK` points
+/// into `live_dir/desktop-*` are touched. Call once at start-up, after the daemon owns its socket.
+pub fn clean_leftovers(live_dir: &Path) {
+    let leftovers = find_leftovers(live_dir);
+    if !leftovers.is_empty() {
+        tracing::warn!(
+            "terminating {} leftover process(es) of an earlier daemon",
+            leftovers.len()
+        );
+        for &pid in &leftovers {
+            // A client is its own group leader; the group catches what it spawned.
+            let _ = kill_process_group(pid, Signal::TERM);
+            let _ = kill_process(pid, Signal::TERM);
+        }
+        let deadline = Instant::now() + LEFTOVER_GRACE;
+        while Instant::now() < deadline && !find_leftovers(live_dir).is_empty() {
+            thread::sleep(Duration::from_millis(50));
+        }
+        for pid in find_leftovers(live_dir) {
+            tracing::warn!("killing leftover process {}", pid.as_raw_nonzero());
+            let _ = kill_process_group(pid, Signal::KILL);
+            let _ = kill_process(pid, Signal::KILL);
+        }
+    }
+    let Ok(entries) = fs::read_dir(live_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("desktop-") {
+            tracing::info!("removing stale {}", entry.path().display());
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// The first word of a shell command line, for messages.
 fn first_word(command: &str) -> &str {
     command.split_whitespace().next().unwrap_or(command)
@@ -202,6 +403,8 @@ struct Client {
     gave_up: bool,
     /// What the user should fix, while there is something.
     problem: Option<String>,
+    /// The last stderr line of the current (or last) run.
+    stderr_tail: Arc<StderrTail>,
 }
 
 impl Client {
@@ -215,14 +418,29 @@ impl Client {
             restart_at: now,
             gave_up: false,
             problem: None,
+            stderr_tail: Arc::default(),
+        }
+    }
+
+    /// `message` with the program's own last error line appended, when it printed one.
+    fn with_detail(&self, message: String) -> String {
+        match self.stderr_tail.get() {
+            Some(detail) => format!("{message}: {detail}"),
+            None => message,
         }
     }
 
     fn spawn(&mut self, display: &str, sway_sock: &Path) -> std::io::Result<()> {
-        let mut command = Command::new("sh");
+        let mut command = guarded_command("sh");
         command.arg("-c").arg(&self.command);
         client_env(display, sway_sock).apply(&mut command);
-        self.child = Some(spawn_logged(&mut command, &self.command)?);
+        let tail = Arc::new(StderrTail::default());
+        self.child = Some(spawn_logged(
+            &mut command,
+            &self.command,
+            Some(Arc::clone(&tail)),
+        )?);
+        self.stderr_tail = tail;
         self.started = Instant::now();
         Ok(())
     }
@@ -233,12 +451,12 @@ impl Client {
         let word = first_word(&self.command);
         match code {
             Some(EXIT_NOT_FOUND) => {
-                self.problem = Some(format!("command not found: {word}"));
+                self.problem = Some(self.with_detail(format!("command not found: {word}")));
                 self.gave_up = true;
                 return;
             }
             Some(EXIT_NOT_EXECUTABLE) => {
-                self.problem = Some(format!("command is not executable: {word}"));
+                self.problem = Some(self.with_detail(format!("command is not executable: {word}")));
                 self.gave_up = true;
                 return;
             }
@@ -253,7 +471,8 @@ impl Client {
         };
         if self.quick_failures >= REPORT_AFTER_QUICK_FAILURES {
             let status = code.map_or_else(|| "killed by a signal".to_owned(), |c| c.to_string());
-            self.problem = Some(format!("`{word}` keeps exiting (status {status})"));
+            self.problem =
+                Some(self.with_detail(format!("`{word}` keeps exiting (status {status})")));
         }
     }
 
@@ -320,10 +539,10 @@ impl VirtualDesktop {
             return Err(format!("writing {}: {e}", config_path.display()));
         }
 
-        let mut command = Command::new("sway");
+        let mut command = guarded_sway();
         command.arg("--config").arg(&config_path);
         sway_env(&sway_sock).apply(&mut command);
-        let sway = match spawn_logged(&mut command, "sway") {
+        let sway = match spawn_logged(&mut command, "sway", None) {
             Ok(child) => child,
             Err(e) => {
                 let _ = fs::remove_dir_all(run_dir);
@@ -473,6 +692,52 @@ mod tests {
         assert_eq!(quote_in_single("/a b/it's$x"), "\"/a b/it'\\''s\\$x\"");
     }
 
+    fn argv<'a>(parts: &[&'a str]) -> Vec<&'a [u8]> {
+        parts.iter().map(|p| p.as_bytes()).collect()
+    }
+
+    #[test]
+    fn leftover_sway_matches_only_our_run_dir() {
+        let live = Path::new("/run/user/1000/tt500-lcd/live");
+        let ours = argv(&[
+            "sway",
+            "--config",
+            "/run/user/1000/tt500-lcd/live/desktop-1/sway.conf",
+        ]);
+        assert!(is_leftover_sway(&ours, live));
+        let full = argv(&[
+            "/usr/bin/sway",
+            "--config",
+            "/run/user/1000/tt500-lcd/live/desktop-7/sway.conf",
+        ]);
+        assert!(is_leftover_sway(&full, live));
+        let iprolaunch = argv(&[
+            "sway",
+            "--config",
+            "/run/user/1000/iprolaunch-sunshine/sway.conf",
+        ]);
+        assert!(!is_leftover_sway(&iprolaunch, live));
+        assert!(!is_leftover_sway(&argv(&["sway"]), live));
+        let other = argv(&["vim", "/run/user/1000/tt500-lcd/live/desktop-1/sway.conf"]);
+        assert!(!is_leftover_sway(&other, live));
+        let sibling = argv(&[
+            "sway",
+            "--config",
+            "/run/user/1000/tt500-lcd/live/desktopfoo/sway.conf",
+        ]);
+        assert!(!is_leftover_sway(&sibling, live));
+    }
+
+    #[test]
+    fn leftover_swaysock_matches_only_our_run_dir() {
+        let live = Path::new("/run/user/1000/tt500-lcd/live");
+        let ours = b"HOME=/h\0SWAYSOCK=/run/user/1000/tt500-lcd/live/desktop-1/sway.sock\0";
+        assert!(has_leftover_swaysock(ours, live));
+        let theirs = b"SWAYSOCK=/run/user/1000/sway-ipc.1000.123.sock\0";
+        assert!(!has_leftover_swaysock(theirs, live));
+        assert!(!has_leftover_swaysock(b"", live));
+    }
+
     #[test]
     fn sway_env_is_headless_and_detached_from_the_host() {
         let env = sway_env(Path::new("/run/tt/sway.sock"));
@@ -536,6 +801,57 @@ mod tests {
         // A longer run resets the quick-failure streak.
         client.on_exit(Some(3), QUICK_EXIT, now);
         assert_eq!(client.quick_failures, 0);
+    }
+
+    #[test]
+    fn problem_carries_the_last_stderr_line() {
+        let now = Instant::now();
+        let mut client = Client::new("foo --bar".to_owned(), now);
+        client.stderr_tail.record("first\n");
+        client.stderr_tail.record("  Error: boom  ");
+        client.stderr_tail.record("   ");
+        client.stderr_tail.done.store(true, Ordering::SeqCst);
+        for _ in 0..REPORT_AFTER_QUICK_FAILURES {
+            client.on_exit(Some(1), Duration::from_secs(1), now);
+        }
+        assert_eq!(
+            client.problem.as_deref(),
+            Some("`foo` keeps exiting (status 1): Error: boom")
+        );
+        client.on_exit(Some(127), Duration::from_secs(1), now);
+        assert_eq!(
+            client.problem.as_deref(),
+            Some("command not found: foo: Error: boom")
+        );
+    }
+
+    #[test]
+    fn stderr_line_is_capped() {
+        let tail = StderrTail::default();
+        tail.done.store(true, Ordering::SeqCst);
+        tail.record(&"x".repeat(500));
+        assert_eq!(tail.get().unwrap().chars().count(), STDERR_TAIL_CHARS);
+    }
+
+    #[test]
+    fn a_real_failing_command_reports_its_stderr() {
+        let mut client = Client::new("echo boom >&2; exit 1".to_owned(), Instant::now());
+        let sock = Path::new("/nonexistent/sway.sock");
+        client.spawn("wayland-none", sock).expect("spawn sh");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.child.is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            client.supervise(Instant::now(), "wayland-none", sock);
+        }
+        assert!(client.child.is_none(), "command did not exit");
+        let now = Instant::now();
+        for _ in 0..REPORT_AFTER_QUICK_FAILURES {
+            client.on_exit(Some(1), Duration::from_secs(1), now);
+        }
+        assert_eq!(
+            client.problem.as_deref(),
+            Some("`echo` keeps exiting (status 1): boom")
+        );
     }
 
     #[test]

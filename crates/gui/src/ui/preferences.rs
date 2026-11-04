@@ -11,6 +11,8 @@ use tt500_lcd_setup::{
 };
 
 use super::context::Context;
+use super::player;
+use crate::settings::{self, HwDecode, PREVIEW_MAX_FPS, PREVIEW_MIN_FPS, PreviewSettings};
 
 /// Seconds an error toast stays up in the dialog.
 const ERROR_TOAST_SECS: u32 = 6;
@@ -76,6 +78,7 @@ pub(super) fn show(ctx: &Rc<Context>) {
     group.add(&autostart_row);
     let page = adw::PreferencesPage::new();
     page.add(&group);
+    page.add(&preview_group());
     let dialog = adw::PreferencesDialog::builder()
         .title("Preferences")
         .build();
@@ -165,6 +168,77 @@ pub(super) fn show(ctx: &Rc<Context>) {
     ));
 
     dialog.present(Some(&ctx.window));
+}
+
+/// The "Preview" group: how the crop editor plays animations and videos. Changes apply at once.
+fn preview_group() -> adw::PreferencesGroup {
+    let current = settings::preview();
+    let play_row = adw::SwitchRow::builder()
+        .title("Play animations and videos")
+        .subtitle("Off shows the first frame and runs no decoder")
+        .active(current.play)
+        .build();
+    let fps_row = adw::SpinRow::builder()
+        .title("Preview frame rate")
+        .subtitle("Lower uses less CPU")
+        .adjustment(&gtk::Adjustment::new(
+            f64::from(current.clamped_fps()),
+            f64::from(PREVIEW_MIN_FPS),
+            f64::from(PREVIEW_MAX_FPS),
+            1.0,
+            5.0,
+            0.0,
+        ))
+        .build();
+    let pause_row = adw::SwitchRow::builder()
+        .title("Pause when the window is unfocused")
+        .subtitle("A hidden or minimized window always pauses")
+        .active(current.pause_unfocused)
+        .build();
+    let hw_row = adw::ComboRow::builder()
+        .title("Hardware decoding")
+        .subtitle("VA-API, with automatic fallback to software")
+        .model(&gtk::StringList::new(&["Auto", "Off"]))
+        .selected(match current.hw_decode {
+            HwDecode::Auto => 0,
+            HwDecode::Off => 1,
+        })
+        .build();
+    let commit = {
+        let (play_row, fps_row, pause_row, hw_row) = (
+            play_row.clone(),
+            fps_row.clone(),
+            pause_row.clone(),
+            hw_row.clone(),
+        );
+        Rc::new(move || {
+            settings::set_preview(PreviewSettings {
+                play: play_row.is_active(),
+                fps: fps_row.value().round() as u32,
+                pause_unfocused: pause_row.is_active(),
+                hw_decode: if hw_row.selected() == 1 {
+                    HwDecode::Off
+                } else {
+                    HwDecode::Auto
+                },
+            });
+            player::apply_preview_settings();
+        })
+    };
+    let changed = Rc::clone(&commit);
+    play_row.connect_active_notify(move |_| changed());
+    let changed = Rc::clone(&commit);
+    fps_row.connect_value_notify(move |_| changed());
+    // Pausing is read live by the running preview; no restart is needed, but saving is.
+    let changed = Rc::clone(&commit);
+    pause_row.connect_active_notify(move |_| changed());
+    hw_row.connect_selected_notify(move |_| commit());
+    let group = adw::PreferencesGroup::builder().title("Preview").build();
+    group.add(&play_row);
+    group.add(&fps_row);
+    group.add(&pause_row);
+    group.add(&hw_row);
+    group
 }
 
 fn set_autostart(on: bool) -> Result<(), String> {

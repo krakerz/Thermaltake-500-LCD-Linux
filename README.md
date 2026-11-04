@@ -15,8 +15,9 @@ The panel kit has no Linux software. A small user daemon (`tt500-lcdd`) owns the
 - Show only a chosen region of the source (`--crop`)
 - Brightness 0-100 (0 turns the panel off)
 - A GTK4 / libadwaita app (`tt500-lcd-gui`) with a sidebar: Display > Static picks a file, crops it, sets the frame rate and shows it on the panel; Display > Area streams a virtual desktop (your own commands) or a monitor with the same crop editor; Boot has a Standby image tab and a Boot animation tab, each with its own crop editor, that write to the panel's flash after a dry run and a confirmation; brightness and the panel status are always at the bottom of the sidebar
+- Profiles: save what the panel shows (with brightness and rotation) under a name, switch between them by hand, on a schedule or while a program runs
 - Reconnects automatically after unplugging the panel or passing it to a VM
-- Content and brightness survive restarts
+- Content, brightness and rotation survive restarts
 - Runs as a systemd user service
 
 ## Installation
@@ -84,11 +85,35 @@ tt500-lcd show ~/Videos/clip.mp4
 - `tt500-lcd status` prints what the daemon is doing
 - `tt500-lcd watch` prints the status again every time it changes (`--json` for one JSON line each; Ctrl+C to stop)
 - `tt500-lcd brightness 30` sets the brightness (0-100); it also applies while nothing is shown (the daemon opens the panel briefly)
+- `tt500-lcd rotation 1` rotates the picture (0 = normal, 1 = portrait turned 90° clockwise, 2 = 180°, 3 = portrait turned 90° counter-clockwise; portrait modes use a 128×480 layout, for a panel mounted vertically); the daemon renders everything it shows or uploads rotated, re-renders what is showing when you change it, stores the step and re-applies it after every start-up
 - `tt500-lcd clear` stops streaming and releases the panel; it keeps the brightness (the app's Clear Panel button also resets it to 100)
 - `tt500-lcd standby image.png` uploads a still image as the panel's standby image, the picture the panel shows when nothing is streaming. **This writes to the panel's flash memory**, so it asks "This writes the image to the panel's flash memory. Continue? [y/N]" first (`--yes` skips the question, and is required without a terminal). It takes `--fit` and `--crop` like `show`, accepts stills only (no GIF animations or videos), and re-encodes the image to a small 480x128 JPEG. The upload format comes from a USB capture of the vendor software; the panel's reaction to anything else is unknown, so use it sparingly.
 - `tt500-lcd standby image.png --dry-run` renders the image and builds the exact packets but sends nothing to the panel (it works without a panel). It writes `standby-dryrun.bin` (the raw 1024-byte packets) and `standby-dryrun.txt` (a hex summary) to the daemon's state directory (`$XDG_STATE_HOME/tt500-lcd/`, usually `~/.local/state/tt500-lcd/`) and prints their paths.
 - `tt500-lcd boot animation.gif` uploads an animation as the panel's boot animation, the one it plays at power-on. **This writes to the panel's flash memory**, so it asks "This writes the boot animation to the panel's flash memory. Continue? [y/N]" first (`--yes` skips the question, and is required without a terminal). It takes a GIF, animated PNG or animated WebP (no stills or videos) plus `--fit` and `--crop`, keeps its timing when all its frames last the same 40 to 1000 ms (a 100 ms GIF stays 100 ms, the vendor's 40 ms factory animation stays 40 ms) and otherwise resamples it at its original speed to its most common frame delay (clamped to 40 to 1000 ms), then keeps the first 75 frames (the vendor's factory animation has 75; the daemon log notes a cut). The frames are re-encoded as small 480x128 JPEGs (at most 16 KiB each, 640 KiB in total). While it uploads the daemon pauses streaming, waits for the panel to confirm every 64 KiB block (progress goes to the daemon log) and gives up with an error after 5 seconds without an answer; the panel may then hold a partial boot animation. The format comes from a USB capture of the vendor software; the panel's reaction to anything else is unknown, so use it sparingly.
 - `tt500-lcd boot animation.gif --dry-run` renders the animation and builds the exact packets but sends nothing to the panel (it works without a panel). It writes `boot-dryrun.bin` (the raw 1024-byte packets) and `boot-dryrun.txt` (frame delay, frame sizes, block count and the first bytes of the key packets) to the daemon's state directory and prints their paths.
+
+## Profiles
+
+A profile is a named snapshot of the display: the source (file or live source), fit, crop, frame rate, steady mode, brightness and rotation. The daemon keeps them in `profiles.toml` in its state directory and restores the active one's content after a restart. Boot animation and standby image are flash writes and are never part of a profile.
+
+```sh
+tt500-lcd profile save Day                       # snapshot what the panel shows now
+tt500-lcd profile activate Day
+tt500-lcd profile list [--json]
+tt500-lcd profile move Day 1                     # position, or up / down
+tt500-lcd profile trigger add-time Night 22:00 --days weekdays
+tt500-lcd profile trigger add-range Night 22:00 06:00 --days fri,sat
+tt500-lcd profile trigger add-process Game game.exe
+tt500-lcd profile reset Default                  # back to factory settings
+```
+
+- `profile save NAME` on an existing name replaces its settings and keeps its triggers. Images and videos are referenced by path, not copied: a moved file makes activation fail (the previous content stays, `status` shows the problem, and the daemon retries every 30 s, up to 10 times)
+- Other `profile` commands: `rename`, `delete`, `trigger remove-time|remove-range|remove-process|clear`. `--days` takes `mon,tue,...`, `weekdays`, `weekend` or `daily` (default every day)
+- Triggers: a time range (`add-range START END`, may wrap midnight; `--days` names the day the range starts, so Fri 22:00-06:00 runs until Saturday 06:00) is active from start to end and applies its profile when it begins; a time of day switches the profile on when it passes; "while a process runs" switches it on when the process starts and off when it exits. A process matches by its name (`comm`, up to 15 characters, or the basename of its executable)
+- Default profile: a built-in profile named Default always exists and is listed first. It is the fallback when no trigger applies, so there is no "no profile" state. It cannot be renamed or deleted; you can save over it, reorder it and give it triggers. A new install starts it from the stored content, and `profile reset Default` returns it to factory settings (clear the panel, brightness 100, rotation 0, no triggers), applying them at once if it is active
+- Priority, applied whenever a trigger edge happens (a range or schedule time passes, a process starts or exits): a running process beats an active time range, which beats the latest schedule entry, which beats the profile you picked by hand, which beats Default. Between edges your manual choice holds. When a process or range ends the daemon falls back down this ladder. Among several matches the list order decides (`profile move` or drag in the GUI)
+- A direct `show`, `show-screen`, `show-desktop` or `clear` keeps the active profile's name but marks it "(changed)", and the daemon will fall back to Default rather than your last pick; if Default is active under fallback, the change simply holds until the next trigger edge. Brightness and rotation changes do not mark it
+- GUI: the Profiles page lists them (save current, activate, rename, delete, drag the handle or use the row menu to reorder, edit time ranges, times and processes; Default offers Reset to Defaults); the sidebar footer has a profile switcher (no "none" entry). Activating a profile reloads the Static and Area pages with its settings
 
 ## Graphical app
 
@@ -114,7 +139,7 @@ The daemon notices it is gone and reconnects when it returns.
 `tt500-lcd brightness 0`.
 
 **Can I change the rotation or the boot animation?**
-Not yet. Commands whose meaning is not confirmed are never sent to the panel.
+Rotation: yes, `tt500-lcd rotation 0|1|2|3` (or the GUI sidebar); the picture is rotated on the PC. Boot animation: use `tt500-lcd boot`.
 
 ## License
 
