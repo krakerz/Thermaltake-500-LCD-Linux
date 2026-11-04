@@ -1,0 +1,179 @@
+//! The Preferences dialog: run the daemon as a systemd user service, start this app at login.
+
+use std::cell::Cell;
+use std::path::PathBuf;
+use std::rc::Rc;
+
+use adw::prelude::*;
+use gtk::{gio, glib};
+use tt500_lcd_setup::{
+    DAEMON_BINARY, ServiceState, SystemRunner, config_home, disable_autostart, enable_autostart,
+};
+
+use super::context::Context;
+
+/// Seconds an error toast stays up in the dialog.
+const ERROR_TOAST_SECS: u32 = 6;
+
+/// What the service switch should show after an action.
+struct ServiceOutcome {
+    /// The action's error, if it failed.
+    error: Option<String>,
+    /// The unit's state afterwards, if it could be read.
+    state: Result<ServiceState, String>,
+}
+
+/// Installs (`Some(true)`) or removes (`Some(false)`) the service, then reads its state. Blocking.
+fn service_task(change: Option<bool>, socket: Option<PathBuf>) -> ServiceOutcome {
+    let run = || -> Result<ServiceState, tt500_lcd_setup::SetupError> {
+        let config = config_home()?;
+        match change {
+            Some(true) => {
+                let daemon = tt500_lcd_setup::find_binary(DAEMON_BINARY)?;
+                tt500_lcd_setup::install_service(
+                    &SystemRunner,
+                    &config,
+                    &daemon,
+                    socket.as_deref(),
+                )?;
+            }
+            Some(false) => tt500_lcd_setup::uninstall_service(&SystemRunner, &config)?,
+            None => {}
+        }
+        tt500_lcd_setup::service_status(&SystemRunner, &config)
+    };
+    let error = match run() {
+        Ok(state) => {
+            return ServiceOutcome {
+                error: None,
+                state: Ok(state),
+            };
+        }
+        Err(error) => error.to_string(),
+    };
+    // The action failed: still report the real state so the switch tells the truth.
+    let state = config_home()
+        .and_then(|config| tt500_lcd_setup::service_status(&SystemRunner, &config))
+        .map_err(|e| e.to_string());
+    ServiceOutcome {
+        error: Some(error),
+        state,
+    }
+}
+
+/// Opens the dialog over `ctx`'s window.
+pub(super) fn show(ctx: &Rc<Context>) {
+    let service_row = adw::SwitchRow::builder()
+        .title("Run the panel service at login")
+        .subtitle("Checking…")
+        .sensitive(false)
+        .build();
+    let autostart_row = adw::SwitchRow::builder()
+        .title("Start this app at login")
+        .build();
+    let group = adw::PreferencesGroup::new();
+    group.add(&service_row);
+    group.add(&autostart_row);
+    let page = adw::PreferencesPage::new();
+    page.add(&group);
+    let dialog = adw::PreferencesDialog::builder()
+        .title("Preferences")
+        .build();
+    dialog.add(&page);
+
+    let syncing = Rc::new(Cell::new(false));
+    let socket = ctx.socket.clone().ok();
+
+    // Runs `change` (if any) off the main thread and updates the row and a toast.
+    let apply = {
+        let service_row = service_row.clone();
+        let dialog = dialog.clone();
+        let syncing = Rc::clone(&syncing);
+        Rc::new(move |change: Option<bool>| {
+            service_row.set_sensitive(false);
+            let socket = socket.clone();
+            glib::spawn_future_local(glib::clone!(
+                #[weak]
+                service_row,
+                #[weak]
+                dialog,
+                #[strong]
+                syncing,
+                async move {
+                    let outcome = gio::spawn_blocking(move || service_task(change, socket)).await;
+                    let outcome = outcome.unwrap_or_else(|_| ServiceOutcome {
+                        error: Some("The service action failed unexpectedly".to_owned()),
+                        state: Err("unknown".to_owned()),
+                    });
+                    if let Some(error) = &outcome.error {
+                        let toast = adw::Toast::builder()
+                            .title(error)
+                            .timeout(ERROR_TOAST_SECS)
+                            .use_markup(false)
+                            .build();
+                        dialog.add_toast(toast);
+                    }
+                    syncing.set(true);
+                    match outcome.state {
+                        Ok(state) => {
+                            service_row.set_active(state.unit_installed && state.enabled);
+                            service_row.set_subtitle(state.label());
+                        }
+                        Err(reason) => service_row.set_subtitle(&format!("Unknown ({reason})")),
+                    }
+                    syncing.set(false);
+                    service_row.set_sensitive(true);
+                }
+            ));
+        })
+    };
+    apply(None);
+
+    let on_service = Rc::clone(&apply);
+    let flag = Rc::clone(&syncing);
+    service_row.connect_active_notify(move |row| {
+        if !flag.get() {
+            on_service(Some(row.is_active()));
+        }
+    });
+
+    let flag = Rc::clone(&syncing);
+    flag.set(true);
+    autostart_row.set_active(config_home().is_ok_and(|c| tt500_lcd_setup::autostart_enabled(&c)));
+    flag.set(false);
+    autostart_row.connect_active_notify(glib::clone!(
+        #[weak]
+        dialog,
+        move |row| {
+            if flag.get() {
+                return;
+            }
+            let wanted = row.is_active();
+            if let Err(error) = set_autostart(wanted) {
+                dialog.add_toast(
+                    adw::Toast::builder()
+                        .title(error)
+                        .timeout(ERROR_TOAST_SECS)
+                        .use_markup(false)
+                        .build(),
+                );
+                flag.set(true);
+                row.set_active(!wanted);
+                flag.set(false);
+            }
+        }
+    ));
+
+    dialog.present(Some(&ctx.window));
+}
+
+fn set_autostart(on: bool) -> Result<(), String> {
+    let config = config_home().map_err(|e| e.to_string())?;
+    if on {
+        let gui = std::env::current_exe().map_err(|e| e.to_string())?;
+        enable_autostart(&config, &gui)
+    } else {
+        disable_autostart(&config)
+    }
+    .map_err(|e| e.to_string())
+}

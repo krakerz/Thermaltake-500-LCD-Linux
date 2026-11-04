@@ -1,0 +1,28 @@
+[package]
+name = "tt500-lcd-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GTK app for the tt500-lcd daemon (Thermaltake Tower 500 LCD panel)"
+
+[dependencies]
+tt500-lcd-ipc.workspace = true
+tt500-lcd-setup.workspace = true
+adw.workspace = true
+async-channel.workspace = true
+directories.workspace = true
+gtk.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

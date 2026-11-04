@@ -1,0 +1,18 @@
+# GTK icon name            Lucide icon       [filled]
+tt5-open-symbolic          folder-open
+tt5-clear-symbolic         eraser
+tt5-apply-symbolic         check
+tt5-brightness-symbolic    sun
+tt5-fps-symbolic           gauge
+tt5-crop-symbolic          crop
+tt5-zoom-in-symbolic       zoom-in
+tt5-zoom-out-symbolic      zoom-out
+tt5-reset-symbolic         rotate-ccw
+tt5-remove-symbolic        x
+tt5-panel-symbolic         monitor
+tt5-panel-off-symbolic     monitor-off
+tt5-searching-symbolic     monitor-dot
+tt5-warning-symbolic       triangle-alert
+tt5-display-symbolic       monitor
+tt5-power-symbolic         power
+tt5-area-symbolic          monitor

@@ -1,0 +1,18 @@
+[package]
+name = "tt500-lcd-setup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Install the tt500-lcd daemon as a systemd user service and manage GUI autostart"
+
+[dependencies]
+tt500-lcd-ipc.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

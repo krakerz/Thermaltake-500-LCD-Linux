@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TT500 LCD
+Comment=Show images, GIFs and videos on the Thermaltake Tower 500 LCD panel
+Exec=tt500-lcd-gui
+Icon=io.github.krakerz.Tt500Lcd
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=thermaltake;lcd;panel;tower;
+StartupWMClass=io.github.krakerz.Tt500Lcd

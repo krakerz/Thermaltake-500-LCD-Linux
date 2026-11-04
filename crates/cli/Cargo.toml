@@ -1,0 +1,18 @@
+[package]
+name = "tt500-lcd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line control for the tt500-lcd daemon"
+
+[dependencies]
+tt500-lcd-ipc.workspace = true
+tt500-lcd-setup.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "tt500-lcd-render"
+description = "Image and GIF to panel-ready JPEG frames for the Thermaltake Tower 500 LCD"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tt500-lcd-protocol.workspace = true
+image.workspace = true
+jpeg-encoder.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+png = "0.18.1"
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,2 @@
+# Thermaltake Tower 500 LCD panel kit (RC Pro): let the logged-in user open its hidraw node.
+KERNEL=="hidraw*", ATTRS{idVendor}=="264a", ATTRS{idProduct}=="232a", TAG+="uaccess"
