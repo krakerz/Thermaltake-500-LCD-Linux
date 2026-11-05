@@ -30,6 +30,16 @@ export APPIMAGE_EXTRACT_AND_RUN=1 # no FUSE in CI containers
 export DEPLOY_GTK_VERSION=4
 export LINUXDEPLOY_OUTPUT_VERSION="$version"
 export PATH="$tools:$PATH"
+
+# The GTK plugin copies "<libdir>/gtk-4.0" (GTK 4 print/media modules) and fails when the
+# distro ships none, as the Ubuntu 26.04 CI image does. The app needs no such modules, so
+# an empty directory is enough.
+gtk_libdir="$(pkg-config --variable=libdir gtk4)"
+if [ ! -d "$gtk_libdir/gtk-4.0" ]; then
+    mkdir -p "$gtk_libdir/gtk-4.0" 2>/dev/null ||
+        { echo "build.sh: create $gtk_libdir/gtk-4.0 (needs root) or install GTK 4 modules" >&2; exit 1; }
+fi
+
 (
     cd "$work"
     linuxdeploy --appdir "$appdir" \
