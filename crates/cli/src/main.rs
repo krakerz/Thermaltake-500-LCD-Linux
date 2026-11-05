@@ -18,6 +18,7 @@ use tt500_lcd_ipc::{
 };
 
 use tt500_lcd_setup::SystemRunner;
+use tt500_lcd_update::Updater;
 
 use crate::cli::{AutostartAction, Cli, Command, ServiceAction, desktop_commands};
 use crate::format::format_status;
@@ -65,6 +66,22 @@ fn run(command: Command) -> Result<(), anyhow::Error> {
         } => (
             Request::ShowLive(ShowLiveParams {
                 source: LiveSource::Screen { output },
+                fit,
+                crop,
+                fps,
+                steady: steady.choice(),
+            }),
+            false,
+        ),
+        Command::ShowPortal {
+            reselect,
+            fit,
+            crop,
+            fps,
+            steady,
+        } => (
+            Request::ShowLive(ShowLiveParams {
+                source: LiveSource::Portal { reselect },
                 fit,
                 crop,
                 fps,
@@ -152,6 +169,7 @@ fn run(command: Command) -> Result<(), anyhow::Error> {
         Command::Watch { json } => return watch(json),
         Command::Service { action } => return service(action),
         Command::Autostart { action } => return autostart(action),
+        Command::Update { check } => return update(check),
         Command::Clear => (Request::Clear, false),
         Command::Brightness { value } => {
             (Request::SetBrightness(BrightnessParams { value }), false)
@@ -198,6 +216,49 @@ fn service(action: ServiceAction) -> Result<(), anyhow::Error> {
             println!("enabled at login: {}", yes_no(state.enabled));
             println!("running: {}", yes_no(state.active));
         }
+    }
+    Ok(())
+}
+
+/// `update [--check]`: look for a newer published release and install it.
+fn update(check_only: bool) -> Result<(), anyhow::Error> {
+    let updater = Updater::for_this_install()?;
+    let current = updater.current();
+    let Some(release) = updater.check()? else {
+        println!("tt500-lcd {current} is up to date");
+        return Ok(());
+    };
+    let latest = release.version();
+    if check_only {
+        println!("tt500-lcd {latest} is available (this is {current}); run `tt500-lcd update`");
+        return Ok(());
+    }
+    println!(
+        "Updating {current} -> {latest} ({})",
+        updater.kind().label()
+    );
+    let mut next_report = 0;
+    let applied = updater.apply(&release, &mut |received, total| {
+        let Some(total) = total.filter(|t| *t > 0) else {
+            return;
+        };
+        let percent = received * 100 / total;
+        if percent >= next_report {
+            eprintln!("downloading: {percent} %");
+            next_report = percent / 10 * 10 + 10;
+        }
+    })?;
+    println!("Updated to {latest}");
+    if applied.service_restarted {
+        println!("Restarted the panel service");
+    }
+    if let Some(error) = applied.restart_error {
+        eprintln!(
+            "warning: the service was not restarted ({error}); run `systemctl --user restart tt500-lcd`"
+        );
+    }
+    if applied.gui.is_some() {
+        println!("Restart the GUI to use the new version");
     }
     Ok(())
 }

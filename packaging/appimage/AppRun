@@ -1,0 +1,42 @@
+#!/bin/sh
+# AppImage entry point.
+#   TT500-LCD-*.AppImage [GUI options]    the GUI (default)
+#   TT500-LCD-*.AppImage --cli ARGS...    the tt500-lcd command-line tool
+#   TT500-LCD-*.AppImage --daemon ARGS... the tt500-lcdd daemon in the foreground
+#
+# The systemd unit needs a daemon path that stays valid, but this image's own mount point
+# changes on every run. So each start copies the bundled tt500-lcdd to
+# ~/.local/lib/tt500-lcd/ (only when it differs) and the setup code points the unit there;
+# an updated image refreshes the copy the first time it runs.
+HERE="$(dirname "$(readlink -f "$0")")"
+APPDIR="$HERE"
+export APPDIR
+PATH="$HERE/usr/bin:$PATH"
+export PATH
+
+LIB_DIR="${TT500_LIB_DIR:-${HOME:-/nonexistent}/.local/lib/tt500-lcd}"
+if mkdir -p "$LIB_DIR" 2>/dev/null; then
+    if ! cmp -s "$HERE/usr/bin/tt500-lcdd" "$LIB_DIR/tt500-lcdd" 2>/dev/null; then
+        if cp "$HERE/usr/bin/tt500-lcdd" "$LIB_DIR/.tt500-lcdd.new" 2>/dev/null \
+            && chmod 755 "$LIB_DIR/.tt500-lcdd.new" \
+            && mv -f "$LIB_DIR/.tt500-lcdd.new" "$LIB_DIR/tt500-lcdd"; then
+            :
+        else
+            rm -f "$LIB_DIR/.tt500-lcdd.new"
+            echo "tt500-lcd: could not copy the daemon to $LIB_DIR" >&2
+        fi
+    fi
+    [ -x "$LIB_DIR/tt500-lcdd" ] && TT500_DAEMON="$LIB_DIR/tt500-lcdd" && export TT500_DAEMON
+fi
+[ -n "${APPIMAGE:-}" ] && TT500_GUI="$APPIMAGE" && export TT500_GUI
+
+# GTK runtime settings written by linuxdeploy-plugin-gtk.
+for hook in "$HERE"/apprun-hooks/*.sh; do
+    [ -f "$hook" ] && . "$hook"
+done
+
+case "${1:-}" in
+    --daemon) shift; exec "$HERE/usr/bin/tt500-lcdd" "$@" ;;
+    --cli) shift; exec "$HERE/usr/bin/tt500-lcd" "$@" ;;
+    *) exec "$HERE/usr/bin/tt500-lcd-gui" "$@" ;;
+esac

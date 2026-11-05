@@ -33,9 +33,10 @@ const ZOOM_HINT: &str = "Zoom in to choose a region — at 1× the whole desktop
 const HINT_MAX_ZOOM: f64 = 1.01;
 const COMMAND_TITLE: &str = "Command, e.g. alacritty -e ~/Scripts/sysmon.sh";
 /// Source row entries, in [`AreaSource`] order of this list.
-const SOURCES: [(&str, AreaSource); 2] = [
+const SOURCES: [(&str, AreaSource); 3] = [
     ("Virtual desktop", AreaSource::Desktop),
     ("Screen", AreaSource::Screen),
+    ("Window or screen (portal)", AreaSource::Portal),
 ];
 
 type Preview = Result<Option<(PreviewReply, RgbaImage)>, String>;
@@ -45,6 +46,8 @@ struct Inner {
     panel: CropPanel,
     source_row: adw::ComboRow,
     output_row: adw::ComboRow,
+    choose_row: adw::ActionRow,
+    choose_button: gtk::Button,
     outputs: gtk::StringList,
     size_row: adw::ComboRow,
     width_row: adw::SpinRow,
@@ -84,7 +87,7 @@ impl AreaPage {
 
         let source_row = adw::ComboRow::builder()
             .title("Source")
-            .subtitle("Screen or window through the portal: later")
+            .subtitle("The portal asks once which window or screen to share")
             .model(&gtk::StringList::new(&SOURCES.map(|(label, _)| label)))
             .build();
         let outputs = gtk::StringList::new(&[]);
@@ -92,6 +95,16 @@ impl AreaPage {
             .title("Monitor")
             .model(&outputs)
             .build();
+        let choose_button = gtk::Button::builder()
+            .label("Choose again…")
+            .valign(gtk::Align::Center)
+            .build();
+        let choose_row = adw::ActionRow::builder()
+            .title("Shared window or screen")
+            .subtitle("Remembered after the first choice; pick another one here")
+            .visible(false)
+            .build();
+        choose_row.add_suffix(&choose_button);
         let size_row = adw::ComboRow::builder()
             .title("Desktop size")
             .subtitle("The panel is 15:4; scale 2 draws at half the size")
@@ -125,6 +138,7 @@ impl AreaPage {
         let source_group = adw::PreferencesGroup::builder().title("Source").build();
         source_group.add(&source_row);
         source_group.add(&output_row);
+        source_group.add(&choose_row);
         source_group.add(&size_row);
         source_group.add(&width_row);
         source_group.add(&height_row);
@@ -198,6 +212,8 @@ impl AreaPage {
             panel,
             source_row,
             output_row,
+            choose_row,
+            choose_button,
             outputs,
             size_row,
             width_row,
@@ -238,6 +254,8 @@ impl AreaPage {
         inner.add_button.connect_clicked(move |_| handler(()));
         let handler = weak_call(&weak, |inner, ()| inner.apply());
         inner.apply_button.connect_clicked(move |_| handler(()));
+        let handler = weak_call(&weak, |inner, ()| inner.choose_again());
+        inner.choose_button.connect_clicked(move |_| handler(()));
         let handler = weak_call(&weak, |inner, ()| inner.stop());
         inner.stop_button.connect_clicked(move |_| handler(()));
 
@@ -543,7 +561,10 @@ impl Inner {
         self.size_row.set_visible(desktop);
         self.show_custom_rows();
         self.commands_group.set_visible(desktop);
-        self.output_row.set_visible(!desktop);
+        self.output_row
+            .set_visible(self.source() == AreaSource::Screen);
+        self.choose_row
+            .set_visible(self.source() == AreaSource::Portal);
         self.show_steady();
     }
 
@@ -616,6 +637,9 @@ impl Inner {
             custom_scale: custom.scale,
             steady: self.steady_choice.get(),
             preview: settings::preview(),
+            keep_in_tray: settings::keep_in_tray(),
+            check_updates: settings::check_updates(),
+            last_update_check: settings::last_update_check(),
         };
         if *self.settings.borrow() == settings {
             return;
@@ -669,6 +693,7 @@ impl Inner {
             AreaSource::Screen => {
                 self.set_outputs(&monitor_names(), form.output.as_deref());
             }
+            AreaSource::Portal => {}
         }
         if let Some(fps) = info.max_fps.or(info.fps) {
             self.fps_row.set_value(f64::from(fps));
@@ -703,6 +728,22 @@ impl Inner {
                 source,
                 fit,
                 crop,
+                fps: Some(self.fps()),
+                steady: self.steady_choice.get(),
+            }),
+            "Sent to the panel",
+        );
+    }
+
+    /// Starts the portal source again with its picker, dropping the remembered choice.
+    fn choose_again(&self) {
+        self.reset_preview();
+        self.adopted.set(true);
+        self.ctx.send(
+            Request::ShowLive(ShowLiveParams {
+                source: LiveSource::Portal { reselect: true },
+                fit: Fit::Cover,
+                crop: None,
                 fps: Some(self.fps()),
                 steady: self.steady_choice.get(),
             }),

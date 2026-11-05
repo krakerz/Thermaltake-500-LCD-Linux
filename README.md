@@ -22,7 +22,34 @@ The panel kit has no Linux software. A small user daemon (`tt500-lcdd`) owns the
 
 ## Installation
 
-There are no prebuilt packages yet; build from source (see below), then:
+Pick one of the three ways below. Releases are on the [releases page](https://github.com/krakerz/Thermaltake-500-LCD-Linux/releases).
+
+### Release archive (recommended)
+
+Download `tt500-lcd-<version>-linux-x86_64.tar.gz`, then:
+
+```sh
+tar -xzf tt500-lcd-<version>-linux-x86_64.tar.gz
+cd tt500-lcd-<version>-linux-x86_64
+./install.sh
+```
+
+`install.sh` installs the daemon, CLI and GUI to `~/.local/bin`, the desktop entry and icon under `~/.local/share`, and then runs `tt500-lcd service install`. It is safe to re-run; `--prefix DIR` installs elsewhere, `--no-service` skips the service. It never runs `sudo`: it prints the two commands that install the udev rule, which you run yourself, then replug the panel. `uninstall.sh` (also kept in `~/.local/share/tt500-lcd/`) removes everything it installed and keeps your settings.
+
+### AppImage
+
+Download `TT500-LCD-<version>-x86_64.AppImage`, `chmod +x` it and run it. It opens the GUI and carries the daemon and CLI too:
+
+```sh
+./TT500-LCD-<version>-x86_64.AppImage              # the GUI
+./TT500-LCD-<version>-x86_64.AppImage --cli status # the tt500-lcd command
+```
+
+The systemd service needs a daemon path that stays valid, but an AppImage mounts itself somewhere new on every run. So each start copies its `tt500-lcdd` to `~/.local/lib/tt500-lcd/` (only when it differs), and "Run the panel service at login" (or `--cli service install`) points the unit there; "Start this app at login" points at the AppImage file, so keep it where it is. The udev rule is not installed by the AppImage: copy `70-thermaltake-lcd.rules` from the repository (or the release archive) with the `sudo` commands in step 1 below. AppImages need FUSE 2 (`libfuse2`) unless you run them with `--appimage-extract-and-run`.
+
+### From source
+
+Build it (see below), then:
 
 1. Let your user open the panel (needs root once), then replug the panel:
 
@@ -48,9 +75,15 @@ There are no prebuilt packages yet; build from source (see below), then:
 
    To start the GUI at login (XDG autostart), run `tt500-lcd autostart on` (`off` / `status` also work), or use Preferences > "Start this app at login". The GUI must be installed next to the CLI or in `PATH`; the GUI switch uses the running binary.
 
+   The GUI shows a system-tray icon (StatusNotifierItem; needs a bar or desktop with tray support) with a menu for the window, profile, brightness and Clear Panel. Autostart starts it hidden in the tray (`tt500-lcd-gui --hidden`); closing the window keeps it running in the tray unless you turn that off in Preferences.
+
    Doing it by hand instead: `install -Dm644 packaging/systemd/tt500-lcd.service ~/.config/systemd/user/tt500-lcd.service && systemctl --user daemon-reload && systemctl --user enable --now tt500-lcd.service` (this unit expects the daemon at `~/.local/bin/tt500-lcdd`).
 
 Make sure `~/.local/bin` is in your `PATH`.
+
+### Updating
+
+Installed builds (the release archive or the AppImage) update themselves from the newest published release: Preferences > Updates > "Check for updates" (then "Update" and "Restart"), or `tt500-lcd update` (`--check` only looks). The GUI checks at start-up, at most once a day, unless you turn "Check for updates automatically" off. An update downloads the release, verifies its SHA-256, replaces the daemon, CLI and GUI together (all or nothing; the old version is restored if the new one does not start) and restarts the panel service. Builds from source are not updated this way; rebuild them. To update by hand, run the new archive's `install.sh` or replace the AppImage file.
 
 Video playback needs `ffmpeg` (with `ffprobe`) at runtime; it is optional for images and GIFs. Arch: `sudo pacman -S ffmpeg`; Debian/Ubuntu: `sudo apt install ffmpeg`.
 
@@ -79,6 +112,7 @@ tt500-lcd show ~/Videos/clip.mp4
 - `tt500-lcd show-screen [--output DP-1]` mirrors a screen (wlroots compositors such as Hyprland and sway); it takes `--fit`, `--crop` and `--fps` like `show`
 - `tt500-lcd show-desktop -- alacritty -e ~/Scripts/sysmon.sh` runs the command on a headless virtual desktop and shows it. `--run CMD` (repeatable) adds more commands, `--size WxH` (default 960x256) and `--scale N` (default 2) set the virtual output
 - `tt500-lcd preview -o frame.jpg` saves the latest full frame of the running live source
+- `tt500-lcd show-portal [--reselect]` mirrors a single window or screen chosen in the desktop portal's picker (any compositor with xdg-desktop-portal ScreenCast, including Hyprland); it takes `--fit`, `--crop`, `--fps` and `--steady` like `show-screen`. It needs GStreamer with the PipeWire plugin (`gst-plugin-pipewire`). The first start asks which window or screen to share (answer within 25 s); the daemon remembers the choice (a restore token in its state dir), `--reselect` or the GUI's "Choose again…" asks again, and the stream stops when the shared window is closed
 - `--steady` / `--no-steady` (`show-desktop`, `show-screen`) skip or keep half-drawn frames: with steady frames a changed capture is shown only once the next capture matches it, or after 250 ms, which stops a terminal that redraws once a second from flickering, at the cost of a little delay. On by default for the virtual desktop, off for a screen
 - Live sources are streamed by the daemon and restored after a restart (retried for about a minute while the screen comes up). `show-screen` reads `WAYLAND_DISPLAY` from the daemon's environment; if the systemd user service lacks it, run `systemctl --user import-environment WAYLAND_DISPLAY` once per login and restart the service
 - Videos are played from where they are, not copied. If you move or delete one, `tt500-lcd status` shows a problem after the next daemon restart; show it again

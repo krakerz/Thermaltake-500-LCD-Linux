@@ -6,7 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-05
+
 ### Added
+
+- Window or screen capture through the desktop portal (xdg-desktop-portal ScreenCast): `tt500-lcd show-portal [--reselect]`, and a "Window or screen (portal)" source with a "Choose again…" button on the GUI Area tab. The first start shows the portal's picker; the daemon stores the portal's restore token (`portal-token` in its state dir) so later starts do not ask again, and `--reselect` forgets it. The daemon owns the session, so the stream keeps running after the GUI closes; when the shared window or screen is closed the stream stops with that message instead of asking again. Needs GStreamer with the PipeWire plugin (`gst-plugin-pipewire`); the daemon reports a clear error when it is missing
+- Release archive with `install.sh` / `uninstall.sh` and an AppImage, built by GitHub Actions
+- Self-update: Preferences > Updates and `tt500-lcd update [--check]` install the newest published release; the GUI checks once a day unless turned off
+- New app icon: a bold "TT" with an orange "500" badge
+- System-tray icon (StatusNotifierItem) owned by the GUI: left click toggles the window, the menu has Open, a Profile submenu, Brightness (Off/25/50/75/100 %), Clear Panel and Quit, and the tooltip shows the panel status and active profile. Closing the window hides it to the tray when a tray is present and the new preference "Keep running in the tray when the window is closed" (on by default) is set. "Start this app at login" now starts the GUI hidden in the tray (`--hidden`; the window is shown when there is no tray)
 
 - Profiles: named display setups (source, framing, fps, steady, brightness, rotation) kept by the daemon in `profiles.toml`, switched by hand or by triggers: times of day (optionally on chosen weekdays) and "while a process runs". `tt500-lcd profile list|save|activate|rename|delete|move|trigger ...`, a GUI Profiles page (drag to reorder, trigger editor) and a profile switcher in the sidebar footer; the daemon requests are `profile_list`, `profile_save`, `profile_rename`, `profile_delete`, `profile_activate`, `profile_set_triggers` and `profile_reorder`, and `status` reports the active profile. A profile never changes the boot animation or the standby image
 - Profiles: time-range triggers ("active from 22:00 to 06:00", optional weekdays by start day, may wrap midnight; `trigger add-range|remove-range`) that outrank schedule times; a built-in, undeletable Default profile (the fallback when no trigger applies) with `profile reset` / `profile_reset` and a Reset to Defaults item in the GUI; status marks a hand-changed profile as modified ("(changed)"). Clients older than this change cannot parse the new reason kinds

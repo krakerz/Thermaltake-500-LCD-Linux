@@ -78,6 +78,26 @@ pub enum Command {
         #[command(flatten)]
         steady: SteadyArgs,
     },
+    /// Mirror a window or screen chosen in the desktop portal's picker
+    ///
+    /// The first run asks which window or screen to share; the daemon remembers the choice.
+    /// Needs GStreamer with the PipeWire plugin. Stops when the shared window is closed.
+    ShowPortal {
+        /// Forget the remembered choice and ask again
+        #[arg(long)]
+        reselect: bool,
+        /// How to fit the capture onto the 480x128 panel
+        #[arg(long, value_parser = Fit::from_str, default_value_t = Fit::Cover)]
+        fit: Fit,
+        /// Show only this region of the capture, in pixels, before fitting
+        #[arg(long, value_parser = Crop::from_str, value_name = "X,Y,W,H")]
+        crop: Option<Crop>,
+        /// Capture frame rate, 1-30
+        #[arg(long, value_parser = value_parser!(u32).range(1..=i64::from(MAX_FPS)))]
+        fps: Option<u32>,
+        #[command(flatten)]
+        steady: SteadyArgs,
+    },
     /// Run commands on a headless virtual desktop and show it on the panel
     ///
     /// The daemon starts a headless compositor and tiles one window per command. Give one
@@ -197,6 +217,12 @@ pub enum Command {
         /// on, off or status
         #[arg(value_enum)]
         action: AutostartAction,
+    },
+    /// Update to the newest published release (installed builds only)
+    Update {
+        /// Only report whether a newer release exists
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -710,6 +736,27 @@ mod tests {
                 .exit_code(),
             2
         );
+    }
+
+    #[test]
+    fn show_portal_parses_reselect() {
+        assert!(matches!(
+            parse(&["show-portal"]).unwrap().command,
+            Command::ShowPortal {
+                reselect: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["show-portal", "--reselect", "--fps", "10"])
+                .unwrap()
+                .command,
+            Command::ShowPortal {
+                reselect: true,
+                fps: Some(10),
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -73,12 +73,20 @@ pub(super) fn show(ctx: &Rc<Context>) {
     let autostart_row = adw::SwitchRow::builder()
         .title("Start this app at login")
         .build();
+    let tray_row = adw::SwitchRow::builder()
+        .title("Keep running in the tray when the window is closed")
+        .subtitle("Needs a system tray; without one, closing the window quits")
+        .active(settings::keep_in_tray())
+        .build();
+    tray_row.connect_active_notify(|row| settings::set_keep_in_tray(row.is_active()));
     let group = adw::PreferencesGroup::new();
     group.add(&service_row);
     group.add(&autostart_row);
+    group.add(&tray_row);
     let page = adw::PreferencesPage::new();
     page.add(&group);
     page.add(&preview_group());
+    page.add(&super::updates::group(ctx));
     let dialog = adw::PreferencesDialog::builder()
         .title("Preferences")
         .build();
@@ -244,7 +252,8 @@ fn preview_group() -> adw::PreferencesGroup {
 fn set_autostart(on: bool) -> Result<(), String> {
     let config = config_home().map_err(|e| e.to_string())?;
     if on {
-        let gui = std::env::current_exe().map_err(|e| e.to_string())?;
+        let gui =
+            tt500_lcd_setup::find_binary(tt500_lcd_setup::GUI_BINARY).map_err(|e| e.to_string())?;
         enable_autostart(&config, &gui)
     } else {
         disable_autostart(&config)

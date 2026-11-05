@@ -148,7 +148,7 @@ const STDERR_DRAIN_WAIT: Duration = Duration::from_millis(200);
 
 /// The last non-empty stderr line of a child, filled by its reader thread.
 #[derive(Debug, Default)]
-struct StderrTail {
+pub struct StderrTail {
     line: Mutex<String>,
     /// The reader reached the end of the stream.
     done: AtomicBool,
@@ -164,7 +164,7 @@ impl StderrTail {
     }
 
     /// The kept line, after giving the reader a moment to finish.
-    fn get(&self) -> Option<String> {
+    pub fn get(&self) -> Option<String> {
         let deadline = Instant::now() + STDERR_DRAIN_WAIT;
         while !self.done.load(Ordering::SeqCst) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
@@ -176,7 +176,11 @@ impl StderrTail {
 
 /// Forwards a child's output to the log, one debug event per line, and keeps the last
 /// non-empty line in `tail` when given.
-fn log_output(stream: impl Read + Send + 'static, label: String, tail: Option<Arc<StderrTail>>) {
+pub(super) fn log_output(
+    stream: impl Read + Send + 'static,
+    label: String,
+    tail: Option<Arc<StderrTail>>,
+) {
     thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
             tracing::debug!("{label}: {line}");
@@ -219,7 +223,7 @@ fn signal_group(child: &Child, signal: Signal) {
 }
 
 /// SIGTERM the child's process group, give it `grace` to exit, then SIGKILL the group and reap.
-fn stop_group(child: &mut Child, grace: Duration) {
+pub(super) fn stop_group(child: &mut Child, grace: Duration) {
     signal_group(child, Signal::TERM);
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
@@ -234,7 +238,7 @@ fn stop_group(child: &mut Child, grace: Duration) {
 }
 
 /// Whether `program` is an executable file on `PATH`.
-fn in_path(program: &str) -> bool {
+pub(super) fn in_path(program: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|dir| {
@@ -262,7 +266,7 @@ fn setpriv_available() -> bool {
 /// The signal is tied to the *thread* that spawns the child, not the process: spawn only
 /// from a thread that lives as long as the child is wanted. The virtual desktop's capture
 /// thread does, because it owns the desktop and its drop is what stops the children.
-fn guarded_command(program: &str) -> Command {
+pub(super) fn guarded_command(program: &str) -> Command {
     if setpriv_available() && in_path(program) {
         let mut command = Command::new("setpriv");
         command.args(["--pdeathsig", "TERM", "--", program]);

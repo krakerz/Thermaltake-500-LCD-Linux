@@ -6,6 +6,7 @@
 pub mod capture;
 #[cfg(test)]
 pub mod fake;
+pub mod portal;
 pub mod preview;
 pub mod screencopy;
 pub mod steady;
@@ -34,6 +35,8 @@ use crate::streamer::FrameStream;
 
 /// How long `start` waits for the first frame.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
+/// The same for the portal, which first asks the user and must stay below the IPC read timeout.
+const PORTAL_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(28);
 /// Pause before reconnecting after the source vanished.
 const RECONNECT_INTERVAL: Duration = if cfg!(test) {
     Duration::from_millis(50)
@@ -50,6 +53,15 @@ const QUEUE_DEPTH: usize = 2;
 const STOP_GRACE: Duration = Duration::from_secs(3);
 /// Granularity of interruptible sleeps.
 const SLEEP_STEP: Duration = Duration::from_millis(50);
+
+/// The source as it is stored and compared: a one-time `reselect` is not part of it.
+#[must_use]
+pub fn persistent(source: &LiveSource) -> LiveSource {
+    match source {
+        LiveSource::Portal { .. } => LiveSource::Portal { reselect: false },
+        other => other.clone(),
+    }
+}
 
 /// A short description of the source for the status line.
 #[must_use]
@@ -199,7 +211,10 @@ impl FrameStream for LiveStream {
         match self.frames.try_recv() {
             Ok(frame) => VideoPoll::Frame(frame),
             Err(TryRecvError::Empty) => VideoPoll::Pending,
-            Err(TryRecvError::Disconnected) => VideoPoll::Ended("the capture stopped".to_owned()),
+            Err(TryRecvError::Disconnected) => VideoPoll::Ended(
+                self.problem()
+                    .unwrap_or_else(|| "the capture stopped".to_owned()),
+            ),
         }
     }
 
@@ -231,7 +246,7 @@ impl LiveStream {
             slot.take()
                 .ok_or_else(|| CaptureError::Failed("the test capturer is used up".to_owned()))
         });
-        Self::spawn(spec, connect, options, fps, steady)
+        Self::spawn(spec, connect, options, fps, steady, FIRST_FRAME_TIMEOUT)
     }
 
     fn spawn(
@@ -240,6 +255,7 @@ impl LiveStream {
         options: RenderOptions,
         fps: u32,
         steady: bool,
+        first_timeout: Duration,
     ) -> Result<(Self, LiveControl, Size), IpcError> {
         let shared = Arc::new(Shared {
             spec,
@@ -277,14 +293,14 @@ impl LiveStream {
             shared: Arc::clone(&shared),
             handle: Some(handle),
         };
-        let (first, size) = match first_rx.recv_timeout(FIRST_FRAME_TIMEOUT) {
+        let (first, size) = match first_rx.recv_timeout(first_timeout) {
             Ok(result) => result?,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 return Err(IpcError {
                     code: ErrorCode::Unavailable,
                     message: format!(
                         "the source gave no frame within {} s",
-                        FIRST_FRAME_TIMEOUT.as_secs()
+                        first_timeout.as_secs()
                     ),
                 });
             }
@@ -390,12 +406,17 @@ impl Worker {
     fn retry_or_give_up(&mut self, err: &CaptureError) -> bool {
         let pause = match err {
             CaptureError::Gone(_) => RECONNECT_INTERVAL,
-            CaptureError::Failed(_) => FAILED_RETRY,
+            CaptureError::Failed(_) | CaptureError::Closed(_) => FAILED_RETRY,
         };
         if self.fail_first(IpcError {
             code: ErrorCode::Unavailable,
             message: err.to_string(),
         }) {
+            return false;
+        }
+        if matches!(err, CaptureError::Closed(_)) {
+            // Reconnecting would only ask the user again: stop and say why.
+            self.set_problem(Some(err.to_string()));
             return false;
         }
         tracing::warn!("live capture: {err}; retrying in {pause:?}");
@@ -531,7 +552,12 @@ fn host_wayland_socket() -> Result<PathBuf, IpcError> {
 /// is still being torn down.
 static DESKTOP_GENERATION: AtomicUsize = AtomicUsize::new(0);
 
-fn connector(source: &LiveSource, run_dir: &Path) -> Result<Connect, IpcError> {
+fn connector(
+    source: &LiveSource,
+    run_dir: &Path,
+    state_dir: &Path,
+    fps: u32,
+) -> Result<Connect, IpcError> {
     match source {
         LiveSource::Desktop(spec) => {
             let spec = spec.clone();
@@ -552,12 +578,35 @@ fn connector(source: &LiveSource, run_dir: &Path) -> Result<Connect, IpcError> {
                 Ok(Box::new(capturer) as Box<dyn Capturer>)
             }))
         }
-        LiveSource::Portal { .. } => Err(IpcError {
-            code: ErrorCode::Unsupported,
-            message: "screen or window capture through the portal is not available yet; \
-                      use a monitor or a virtual desktop"
-                .to_owned(),
-        }),
+        LiveSource::Portal { reselect } => {
+            if !portal::gstreamer_available() {
+                return Err(IpcError {
+                    code: ErrorCode::Unavailable,
+                    message: "window capture needs GStreamer with the PipeWire plugin \
+                              (gst-launch-1.0 and pipewiresrc, package gst-plugin-pipewire)"
+                        .to_owned(),
+                });
+            }
+            let tokens = portal::TokenFile::new(state_dir);
+            let mut reselect = *reselect;
+            let mut used = false;
+            Ok(Box::new(move || {
+                if std::mem::replace(&mut used, true) {
+                    // Opening again would show the picker again.
+                    return Err(CaptureError::Closed(
+                        "the shared window or screen was closed; choose it again".to_owned(),
+                    ));
+                }
+                let mut bus = portal::BusPortal::connect()?;
+                let capturer = portal::connect(
+                    &mut bus,
+                    &tokens,
+                    std::mem::take(&mut reselect),
+                    |fd, node, size| portal::spawn_gst(fd, node, size, fps),
+                )?;
+                Ok(Box::new(capturer) as Box<dyn Capturer>)
+            }))
+        }
         _ => Err(IpcError {
             code: ErrorCode::Unsupported,
             message: "unsupported live source".to_owned(),
@@ -567,22 +616,28 @@ fn connector(source: &LiveSource, run_dir: &Path) -> Result<Connect, IpcError> {
 
 /// Starts capturing `source` and waits for its first frame.
 ///
-/// `run_dir` holds the virtual desktop's files. Returns the stream for the streamer, the
+/// `run_dir` holds the virtual desktop's files, `state_dir` the portal's restore token. Returns the stream for the streamer, the
 /// control for the server and the source size (the crop's coordinate space).
 ///
 /// # Errors
 ///
-/// [`ErrorCode::Unsupported`] for the portal, [`ErrorCode::Unavailable`] when the source
-/// can't be reached or gives no frame within 15 s.
+/// [`ErrorCode::Unavailable`] when the source can't be reached (or the portal needs
+/// GStreamer and has none) or gives no frame in time (15 s, 28 s for the portal).
 pub fn start(
     source: LiveSource,
     options: RenderOptions,
     fps: u32,
     steady: bool,
     run_dir: &Path,
+    state_dir: &Path,
 ) -> Result<(LiveStream, LiveControl, Size), IpcError> {
-    let connect = connector(&source, run_dir)?;
-    LiveStream::spawn(source, connect, options, fps, steady)
+    let connect = connector(&source, run_dir, state_dir, fps)?;
+    let timeout = if matches!(source, LiveSource::Portal { .. }) {
+        PORTAL_FIRST_FRAME_TIMEOUT
+    } else {
+        FIRST_FRAME_TIMEOUT
+    };
+    LiveStream::spawn(persistent(&source), connect, options, fps, steady, timeout)
 }
 
 #[cfg(test)]
@@ -718,8 +773,15 @@ mod tests {
             seen.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(Flaky(FakeCapturer::new(64, 32), 0)))
         });
-        let (stream, control, _) =
-            LiveStream::spawn(spec(), connect, RenderOptions::default(), 30, false).unwrap();
+        let (stream, control, _) = LiveStream::spawn(
+            spec(),
+            connect,
+            RenderOptions::default(),
+            30,
+            false,
+            FIRST_FRAME_TIMEOUT,
+        )
+        .unwrap();
         wait_for("a reconnect", || connects.load(Ordering::SeqCst) >= 2);
         assert!(control.is_alive());
         assert!(count_frames(&stream, Duration::from_millis(300)) > 0);
@@ -728,23 +790,60 @@ mod tests {
     #[test]
     fn a_source_that_never_connects_fails_the_start() {
         let connect: Connect = Box::new(|| Err(CaptureError::Failed("no compositor".to_owned())));
-        let err =
-            LiveStream::spawn(spec(), connect, RenderOptions::default(), 30, false).unwrap_err();
+        let err = LiveStream::spawn(
+            spec(),
+            connect,
+            RenderOptions::default(),
+            30,
+            false,
+            FIRST_FRAME_TIMEOUT,
+        )
+        .unwrap_err();
         assert_eq!(err.code, ErrorCode::Unavailable);
         assert!(err.message.contains("no compositor"), "{}", err.message);
     }
 
     #[test]
-    fn portal_is_not_available_yet() {
-        let err = start(
-            LiveSource::Portal { reselect: false },
+    fn a_closed_source_ends_the_stream_with_its_reason_and_is_not_reopened() {
+        let connects = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&connects);
+        /// One frame, then gone.
+        struct OneShot(FakeCapturer, bool);
+        impl Capturer for OneShot {
+            fn capture(&mut self) -> Result<RgbImage, CaptureError> {
+                if std::mem::replace(&mut self.1, true) {
+                    return Err(CaptureError::Gone("stream ended".to_owned()));
+                }
+                self.0.capture()
+            }
+        }
+        let mut first = Some(OneShot(FakeCapturer::new(64, 32), false));
+        let connect: Connect = Box::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            match first.take() {
+                Some(capturer) => Ok(Box::new(capturer) as Box<dyn Capturer>),
+                None => Err(CaptureError::Closed("closed by the user".to_owned())),
+            }
+        });
+        let (stream, control, _) = LiveStream::spawn(
+            spec(),
+            connect,
             RenderOptions::default(),
-            15,
+            30,
             false,
-            Path::new("/nonexistent"),
+            FIRST_FRAME_TIMEOUT,
         )
-        .unwrap_err();
-        assert_eq!(err.code, ErrorCode::Unsupported);
+        .unwrap();
+        wait_for("the worker to stop", || !control.is_alive());
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+        let mut ended = None;
+        for _ in 0..50 {
+            if let VideoPoll::Ended(reason) = stream.poll() {
+                ended = Some(reason);
+                break;
+            }
+        }
+        assert_eq!(ended.as_deref(), Some("closed by the user"));
     }
 
     #[test]

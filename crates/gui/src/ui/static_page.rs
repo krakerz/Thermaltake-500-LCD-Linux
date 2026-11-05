@@ -101,6 +101,11 @@ impl StaticPage {
         &self.scroller
     }
 
+    /// Clears the panel, resets its brightness and drops the draft (the Clear Panel button).
+    pub fn clear_panel(&self) {
+        self.inner.clear_panel();
+    }
+
     pub fn choose_file(&self) {
         self.inner.file.choose_file();
     }

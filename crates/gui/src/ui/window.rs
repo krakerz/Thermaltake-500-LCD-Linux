@@ -7,7 +7,8 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use tt500_lcd_ipc::{
-    BrightnessParams, ContentKind, DEFAULT_BRIGHTNESS, Request, RotationParams, Status,
+    BrightnessParams, ContentKind, DEFAULT_BRIGHTNESS, ProfileNameParams, Request, RotationParams,
+    Status,
 };
 
 use super::area_page::AreaPage;
@@ -18,8 +19,11 @@ use super::icons::{self, icon};
 use super::profile_switcher::ProfileSwitcher;
 use super::profiles_page::ProfilesPage;
 use super::static_page::StaticPage;
+use super::tray_link::TrayLink;
 use crate::daemon::{self, Update};
+use crate::settings;
 use crate::state::{Connection, START_HINT};
+use crate::tray::{Action, Tray};
 
 /// The content-error banner button while a live source is shown.
 const EDIT_COMMANDS: &str = "Edit Commands";
@@ -27,15 +31,20 @@ const EDIT_COMMANDS: &str = "Edit Commands";
 /// Pause after the last brightness slider move before it is sent.
 const BRIGHTNESS_DEBOUNCE: Duration = Duration::from_millis(150);
 
-/// Presents the main window, or raises the existing one.
-pub fn present(app: &adw::Application) {
+/// Presents the main window, or raises the existing one. With `start_hidden` the window stays
+/// hidden in the tray (shown anyway when no tray can be registered).
+pub fn present(app: &adw::Application, start_hidden: bool) {
     if let Some(window) = app.active_window() {
         window.present();
         return;
     }
     let shell = Shell::build(app);
-    shell.window.present();
+    if !start_hidden {
+        shell.window.present();
+    }
     shell.start_watching();
+    super::updates::auto_check(&shell.ctx);
+    shell.start_tray(app, start_hidden);
 }
 
 /// The brightness slider (global: it applies to every source). Cloning shares it.
@@ -268,6 +277,7 @@ struct Shell {
     profile_revision: Cell<Option<u64>>,
     /// The activation counter last seen, `None` before the first status.
     profile_activation: Cell<Option<u64>>,
+    tray: Rc<TrayLink>,
 }
 
 impl Shell {
@@ -438,6 +448,7 @@ impl Shell {
             profile_switcher,
             profile_revision: Cell::new(None),
             profile_activation: Cell::new(None),
+            tray: Rc::default(),
         });
         let weak = Rc::downgrade(&shell);
         let select = weak_call(&weak, |shell, index: i32| shell.select_page(index));
@@ -452,13 +463,10 @@ impl Shell {
         shell.window.add_action(&preferences);
         let open = weak_call(&weak, |shell, ()| shell.fix_content_error());
         shell.error_banner.connect_button_clicked(move |_| open(()));
-        let stop = weak_call(&weak, |shell, ()| {
-            shell.static_page.stop();
-            shell.boot_page.stop();
-        });
+        let close = weak_call(&weak, |shell, ()| shell.close_requested());
         shell.window.connect_close_request(move |_| {
-            stop(());
-            glib::Propagation::Proceed
+            close(());
+            glib::Propagation::Stop
         });
         if let Some(first) = sidebar_list.row_at_index(0) {
             sidebar_list.select_row(Some(&first));
@@ -467,6 +475,94 @@ impl Shell {
         shell.split_view.set_show_content(true);
         shell.refresh();
         shell
+    }
+
+    /// The window's close button: hide to the tray when there is one and the user wants that,
+    /// else quit.
+    fn close_requested(&self) {
+        self.hide();
+        if !(self.tray.active() && settings::keep_in_tray()) {
+            match self.window.application() {
+                Some(app) => app.quit(),
+                None => self.window.destroy(),
+            }
+        }
+    }
+
+    /// Stops the previews and hides the window.
+    fn hide(&self) {
+        self.static_page.stop();
+        self.boot_page.stop();
+        self.window.set_visible(false);
+    }
+
+    /// Registers the tray icon (off the main thread) and serves its menu. Without a tray, logs
+    /// it once and carries on; a window that was meant to stay hidden is then shown.
+    fn start_tray(self: &Rc<Self>, app: &adw::Application, start_hidden: bool) {
+        let (actions_tx, actions) = async_channel::unbounded();
+        // Keeps the app alive while the window is hidden or the tray is still registering.
+        let hold = app.hold();
+        let initial = TrayLink::state_for(&self.ctx);
+        let shell = Rc::downgrade(self);
+        let app = app.clone();
+        glib::spawn_future_local(async move {
+            let spawned = gio::spawn_blocking(move || Tray::spawn(initial, actions_tx)).await;
+            let Some(first) = shell.upgrade() else {
+                return;
+            };
+            match spawned {
+                Ok(Ok(tray)) => {
+                    first.tray.install(tray, hold, &first.ctx);
+                    // The status may have changed while the tray registered.
+                    first.tray.sync(&first.ctx);
+                }
+                Ok(Err(error)) => {
+                    tracing::info!("no system tray, running without one: {error}");
+                    drop(hold);
+                    first.window.present();
+                    return;
+                }
+                Err(_) => {
+                    tracing::info!("no system tray: the registration failed");
+                    drop(hold);
+                    first.window.present();
+                    return;
+                }
+            }
+            drop(first);
+            if start_hidden {
+                tracing::debug!("started hidden in the tray");
+            }
+            while let Ok(action) = actions.recv().await {
+                let Some(shell) = shell.upgrade() else {
+                    break;
+                };
+                shell.run_tray_action(&app, action);
+            }
+        });
+    }
+
+    /// Does what a tray click asked for. Runs on the main thread.
+    fn run_tray_action(&self, app: &adw::Application, action: Action) {
+        match action {
+            Action::Open => self.window.present(),
+            Action::Toggle if self.window.is_visible() => self.hide(),
+            Action::Toggle => self.window.present(),
+            Action::ActivateProfile(name) => self.ctx.send(
+                Request::ProfileActivate(ProfileNameParams { name }),
+                "Profile activated",
+            ),
+            Action::SetBrightness(value) => {
+                self.ctx
+                    .send(Request::SetBrightness(BrightnessParams { value }), "");
+            }
+            Action::ClearPanel => self.static_page.clear_panel(),
+            Action::Quit => {
+                self.static_page.stop();
+                self.boot_page.stop();
+                app.quit();
+            }
+        }
     }
 
     /// Shows the page of sidebar row `index` and gives its views to the switcher.
@@ -583,6 +679,7 @@ impl Shell {
             None => self.brightness.update_label(),
         }
         self.refresh_profiles(status.as_ref());
+        self.tray.sync(&self.ctx);
         self.static_page.refresh(status.as_ref());
         self.boot_page.refresh();
         if self.area_page.refresh(status.as_ref()) {
@@ -599,9 +696,12 @@ impl Shell {
                 self.profile_revision.set(Some(profile.revision));
                 let page = self.profiles_page.clone();
                 let switcher = self.profile_switcher.clone();
+                let tray = Rc::clone(&self.tray);
+                let ctx = Rc::clone(&self.ctx);
                 self.ctx.reload_profiles(move || {
                     page.set_profiles();
                     switcher.set_profiles();
+                    tray.sync(&ctx);
                 });
             }
             let seen = self.profile_activation.replace(Some(profile.activation));

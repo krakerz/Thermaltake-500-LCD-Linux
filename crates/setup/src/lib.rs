@@ -11,7 +11,9 @@ pub use autostart::{autostart_enabled, disable_autostart, enable_autostart};
 pub use error::SetupError;
 pub use files::{config_home, find_binary};
 pub use runner::{Runner, SystemRunner};
-pub use service::{ServiceState, UNIT_NAME, install_service, service_status, uninstall_service};
+pub use service::{
+    ServiceState, UNIT_NAME, install_service, restart_service, service_status, uninstall_service,
+};
 
 /// File name of the daemon binary.
 pub const DAEMON_BINARY: &str = "tt500-lcdd";

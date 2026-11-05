@@ -35,13 +35,14 @@ pub fn autostart_enabled(config_home: &Path) -> bool {
     entry_path(config_home).is_file()
 }
 
-/// Writes the autostart entry that starts the GUI at `gui` at login.
+/// Writes the autostart entry that starts the GUI at `gui` at login, hidden in the tray.
 ///
 /// # Errors
 ///
 /// Fails when the path cannot be quoted or the file cannot be written.
 pub fn enable_autostart(config_home: &Path, gui: &Path) -> Result<(), SetupError> {
-    let mut entry = replace_line(DESKTOP_TEMPLATE, "Exec=", &exec_key(gui)?);
+    let exec = format!("{} --hidden", exec_key(gui)?);
+    let mut entry = replace_line(DESKTOP_TEMPLATE, "Exec=", &exec);
     entry.push_str("X-GNOME-Autostart-enabled=true\n");
     write_atomic(&entry_path(config_home), &entry)
 }
@@ -69,7 +70,7 @@ mod tests {
         assert!(autostart_enabled(dir.path()));
         let entry = fs::read_to_string(entry_path(dir.path())).unwrap();
         assert!(
-            entry.contains("\nExec=\"/opt/g ui/tt500-lcd-gui\"\n"),
+            entry.contains("\nExec=\"/opt/g ui/tt500-lcd-gui\" --hidden\n"),
             "{entry}"
         );
         assert!(entry.contains("Name=TT500 LCD"));

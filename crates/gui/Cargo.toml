@@ -10,11 +10,13 @@ description = "GTK app for the tt500-lcd daemon (Thermaltake Tower 500 LCD panel
 [dependencies]
 tt500-lcd-ipc.workspace = true
 tt500-lcd-setup.workspace = true
+tt500-lcd-update.workspace = true
 adw.workspace = true
 async-channel.workspace = true
 directories.workspace = true
 gtk.workspace = true
 image.workspace = true
+ksni.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

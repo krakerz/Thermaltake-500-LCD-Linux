@@ -359,7 +359,7 @@ fn live_info(params: &ShowLiveParams, fps: u32, steady: bool, size: Option<Size>
         duration_ms: None,
         path: None,
         max_fps: params.fps,
-        live: Some(params.source.clone()),
+        live: Some(live::persistent(&params.source)),
         steady: Some(steady),
     }
 }
@@ -368,7 +368,7 @@ fn live_info(params: &ShowLiveParams, fps: u32, steady: bool, size: Option<Size>
 ///
 /// # Errors
 /// `BadRequest` for a bad fps or desktop spec, `Unavailable` when the source can't be reached
-/// and `Unsupported` for the portal.
+/// (or the portal's GStreamer is missing).
 pub fn show_live(ctx: &ServerContext, params: ShowLiveParams) -> Result<Status, IpcError> {
     check_fps(params.fps)?;
     if let LiveSource::Desktop(spec) = &params.source {
@@ -382,10 +382,13 @@ pub fn show_live(ctx: &ServerContext, params: ShowLiveParams) -> Result<Status, 
         .steady
         .unwrap_or_else(|| live::default_steady(&params.source));
     let options = store::render_options(params.fit, params.crop, params.fps, ctx.store.rotation());
+    let source = live::persistent(&params.source);
+    let reselect = matches!(params.source, LiveSource::Portal { reselect: true });
     let mut slot = ctx.live.lock().expect("lock poisoned");
     if let Some(control) = slot.as_ref()
-        && control.spec() == &params.source
+        && control.spec() == &source
         && control.is_alive()
+        && !reselect
     {
         control.set_options(options, fps, steady);
         let size = control.latest().map(|(img, _)| Size {
@@ -393,25 +396,21 @@ pub fn show_live(ctx: &ServerContext, params: ShowLiveParams) -> Result<Status, 
             height: img.height(),
         });
         let info = live_info(&params, fps, steady, size);
-        ctx.store.replace_live(
-            &params.source,
-            params.fit,
-            params.crop,
-            params.fps,
-            params.steady,
-        )?;
+        ctx.store
+            .replace_live(&source, params.fit, params.crop, params.fps, params.steady)?;
         return ask(ctx, |reply| Command::UpdateInfo { info, reply });
     }
-    let (stream, control, size) =
-        live::start(params.source.clone(), options, fps, steady, &ctx.run_dir)?;
-    let info = live_info(&params, fps, steady, Some(size));
-    ctx.store.replace_live(
-        &params.source,
-        params.fit,
-        params.crop,
-        params.fps,
-        params.steady,
+    let (stream, control, size) = live::start(
+        params.source.clone(),
+        options,
+        fps,
+        steady,
+        &ctx.run_dir,
+        ctx.store.state_dir(),
     )?;
+    let info = live_info(&params, fps, steady, Some(size));
+    ctx.store
+        .replace_live(&source, params.fit, params.crop, params.fps, params.steady)?;
     *slot = Some(control);
     ask(ctx, |reply| Command::Show {
         content: Content::Live(stream),

@@ -110,6 +110,13 @@ pub struct GuiSettings {
     pub steady: Option<bool>,
     /// The editor preview's behaviour.
     pub preview: PreviewSettings,
+    /// Closing the window hides it to the tray (when there is one) instead of quitting.
+    pub keep_in_tray: bool,
+    /// Look for a newer release at start-up (at most once a day).
+    pub check_updates: bool,
+    /// When the last update check ran, in seconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_update_check: Option<u64>,
 }
 
 impl Default for GuiSettings {
@@ -122,6 +129,64 @@ impl Default for GuiSettings {
             custom_scale: DEFAULT_CUSTOM.scale,
             steady: None,
             preview: PreviewSettings::default(),
+            keep_in_tray: true,
+            check_updates: true,
+            last_update_check: None,
+        }
+    }
+}
+
+/// Whether closing the window should keep the app running in the tray.
+#[must_use]
+pub fn keep_in_tray() -> bool {
+    path().map_or_else(
+        || GuiSettings::default().keep_in_tray,
+        |p| load(&p).keep_in_tray,
+    )
+}
+
+/// Saves the "keep running in the tray" choice, keeping the file's other settings.
+pub fn set_keep_in_tray(keep: bool) {
+    if let Some(path) = path() {
+        let mut all = load(&path);
+        all.keep_in_tray = keep;
+        if let Err(error) = save(&path, &all) {
+            tracing::warn!("cannot save {}: {error}", path.display());
+        }
+    }
+}
+
+/// Whether to check for updates at start-up.
+#[must_use]
+pub fn check_updates() -> bool {
+    path().map_or_else(
+        || GuiSettings::default().check_updates,
+        |p| load(&p).check_updates,
+    )
+}
+
+/// Saves the "check for updates automatically" choice, keeping the file's other settings.
+pub fn set_check_updates(on: bool) {
+    update_saved(|all| all.check_updates = on);
+}
+
+/// When the last update check ran, if ever.
+#[must_use]
+pub fn last_update_check() -> Option<u64> {
+    path().and_then(|p| load(&p).last_update_check)
+}
+
+/// Records that an update check ran at `when` (seconds since the Unix epoch).
+pub fn set_last_update_check(when: u64) {
+    update_saved(|all| all.last_update_check = Some(when));
+}
+
+fn update_saved(change: impl FnOnce(&mut GuiSettings)) {
+    if let Some(path) = path() {
+        let mut all = load(&path);
+        change(&mut all);
+        if let Err(error) = save(&path, &all) {
+            tracing::warn!("cannot save {}: {error}", path.display());
         }
     }
 }
@@ -185,6 +250,9 @@ mod tests {
                 pause_unfocused: false,
                 hw_decode: HwDecode::Off,
             },
+            keep_in_tray: false,
+            check_updates: false,
+            last_update_check: Some(1_700_000_000),
         };
         save(&file, &settings).expect("save");
         assert_eq!(load(&file), settings);
@@ -221,6 +289,30 @@ mod tests {
         assert_eq!(preview.fps, 5);
         assert!(preview.play && preview.pause_unfocused);
         assert_eq!(preview.hw_decode, HwDecode::Auto);
+    }
+
+    #[test]
+    fn keep_in_tray_defaults_on() {
+        assert!(GuiSettings::default().keep_in_tray);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("gui.json");
+        fs::write(&file, r#"{"desktop_scale":1}"#).expect("write");
+        assert!(load(&file).keep_in_tray);
+        fs::write(&file, r#"{"keep_in_tray":false}"#).expect("write");
+        assert!(!load(&file).keep_in_tray);
+    }
+
+    #[test]
+    fn update_checks_default_on_and_never_run() {
+        let defaults = GuiSettings::default();
+        assert!(defaults.check_updates);
+        assert_eq!(defaults.last_update_check, None);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("gui.json");
+        fs::write(&file, r#"{"check_updates":false,"last_update_check":42}"#).expect("write");
+        let loaded = load(&file);
+        assert!(!loaded.check_updates);
+        assert_eq!(loaded.last_update_check, Some(42));
     }
 
     #[test]

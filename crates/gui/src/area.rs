@@ -150,6 +150,8 @@ pub enum AreaSource {
     Desktop,
     /// A monitor of the running session.
     Screen,
+    /// A window or screen chosen in the desktop portal's picker.
+    Portal,
 }
 
 /// The Area tab's controls as plain data.
@@ -185,6 +187,7 @@ impl Form {
             AreaSource::Screen => Ok(LiveSource::Screen {
                 output: self.output.clone(),
             }),
+            AreaSource::Portal => Ok(LiveSource::Portal { reselect: false }),
             AreaSource::Desktop => {
                 let Geometry { size, scale } = self.size.geometry();
                 let spec = DesktopSpec {
@@ -214,6 +217,12 @@ impl Form {
             LiveSource::Screen { output } => Some(Self {
                 source: AreaSource::Screen,
                 output: output.clone(),
+                commands: Vec::new(),
+                size: SizeChoice::Preset(DEFAULT_PRESET),
+            }),
+            LiveSource::Portal { .. } => Some(Self {
+                source: AreaSource::Portal,
+                output: None,
                 commands: Vec::new(),
                 size: SizeChoice::Preset(DEFAULT_PRESET),
             }),
@@ -368,7 +377,12 @@ mod tests {
         let form = Form::from_live(&live).expect("desktop");
         assert_eq!(form.size, SizeChoice::Preset(DEFAULT_PRESET));
         assert_eq!(form.live_source(), Ok(live));
-        assert!(Form::from_live(&LiveSource::Portal { reselect: false }).is_none());
+        let portal = Form::from_live(&LiveSource::Portal { reselect: true }).expect("portal");
+        assert_eq!(portal.source, AreaSource::Portal);
+        assert_eq!(
+            portal.live_source(),
+            Ok(LiveSource::Portal { reselect: false })
+        );
     }
 
     #[test]
