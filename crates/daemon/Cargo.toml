@@ -12,16 +12,20 @@ tt500-lcd-protocol.workspace = true
 tt500-lcd-render.workspace = true
 tt500-lcd-ipc.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 directories.workspace = true
 image.workspace = true
 rustix.workspace = true
 serde.workspace = true
+signal-hook.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 wayland-client.workspace = true
 wayland-protocols-wlr.workspace = true
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+zvariant = "5"
 
 [dev-dependencies]
 tt500-lcd-protocol = { workspace = true, features = ["test-util"] }

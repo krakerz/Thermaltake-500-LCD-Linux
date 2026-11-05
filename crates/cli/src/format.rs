@@ -25,8 +25,24 @@ pub fn format_status(status: &Status) -> String {
         n => format!("{n}%"),
     };
     let mut text = format!("Panel: {panel}\nShowing: {showing}\nBrightness: {brightness}");
+    if let Some(rotation) = status.rotation {
+        let _ = write!(text, "\nRotation: {rotation}");
+    }
     if let Some(err) = &status.content_error {
         let _ = write!(text, "\nProblem: {err}");
+    }
+    if let Some(profile) = &status.profile {
+        if let Some(active) = &profile.active {
+            let changed = if active.modified { ", changed" } else { "" };
+            let _ = write!(
+                text,
+                "\nProfile: {} ({}{changed})",
+                active.name, active.reason
+            );
+        }
+        if let Some(problem) = &profile.problem {
+            let _ = write!(text, "\nProfile problem: {problem}");
+        }
     }
     text
 }
@@ -50,7 +66,7 @@ fn format_content(content: &ContentInfo) -> String {
     format!("{} ({detail})", content.source)
 }
 
-fn format_live(source: &LiveSource) -> String {
+pub(crate) fn format_live(source: &LiveSource) -> String {
     match source {
         LiveSource::Desktop(spec) => format!(
             "virtual desktop {}x{} @{}x, {} command(s)",
@@ -78,7 +94,9 @@ mod tests {
             device,
             content,
             brightness,
+            rotation: None,
             content_error: None,
+            profile: None,
         }
     }
 
@@ -119,6 +137,17 @@ mod tests {
         let mut s = status(DeviceState::Idle, None, 0);
         s.content_error = Some("clip.mkv not found".into());
         assert!(format_status(&s).ends_with("\nProblem: clip.mkv not found"));
+    }
+
+    #[test]
+    fn rotation_line_only_when_reported() {
+        let mut s = status(DeviceState::Idle, None, 100);
+        assert!(!format_status(&s).contains("Rotation"));
+        s.rotation = Some(2);
+        assert_eq!(
+            format_status(&s),
+            "Panel: idle\nShowing: nothing\nBrightness: 100%\nRotation: 2"
+        );
     }
 
     #[test]
@@ -218,5 +247,31 @@ mod tests {
             100,
         );
         assert!(format_status(&s).contains("(live, screen DP-1, cover)"));
+    }
+
+    #[test]
+    fn profile_lines_only_when_reported() {
+        use tt500_lcd_ipc::{ActiveProfile, ProfileReason, ProfileStatus};
+        let mut s = status(DeviceState::Idle, None, 0);
+        assert!(!format_status(&s).contains("Profile"));
+        s.profile = Some(ProfileStatus {
+            revision: 1,
+            activation: 1,
+            active: Some(ActiveProfile {
+                name: "Night".into(),
+                reason: ProfileReason::Schedule,
+                modified: false,
+            }),
+            problem: Some("clip.mkv not found".into()),
+        });
+        let text = format_status(&s);
+        assert!(text.contains("\nProfile: Night (schedule)"));
+        if let Some(p) = s.profile.as_mut().and_then(|p| p.active.as_mut()) {
+            p.name = "Default".into();
+            p.reason = ProfileReason::Fallback;
+            p.modified = true;
+        }
+        assert!(format_status(&s).contains("\nProfile: Default (fallback, changed)"));
+        assert!(text.ends_with("\nProfile problem: clip.mkv not found"));
     }
 }

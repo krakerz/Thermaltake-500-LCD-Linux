@@ -9,5 +9,12 @@ mod file_source;
 pub mod icons;
 mod player;
 mod preferences;
+mod profile_switcher;
+mod profiles_page;
 mod static_page;
+mod tray_link;
+mod trigger_editor;
+mod updates;
 pub mod window;
+
+pub use updates::spawn_pending_relaunch;

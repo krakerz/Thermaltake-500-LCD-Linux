@@ -1,0 +1,96 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: [README.md, CHANGELOG.md, LICENSE, .gitignore]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # The GUI needs libadwaita >= 1.6 (features = ["v1_6"]) and GTK >= 4.12; ubuntu-latest
+    # (24.04) has libadwaita 1.5, so build in a newer Ubuntu where the -dev packages are new
+    # enough.
+    container: ubuntu:26.04
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config file patchelf xz-utils \
+            desktop-file-utils libglib2.0-bin librsvg2-dev \
+            libudev-dev libgtk-4-dev libadwaita-1-dev
+
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version
+        id: version
+        run: |
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version" || { echo "no version in Cargo.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build
+        run: cargo build --workspace --release --locked
+
+      - name: Package the archive
+        run: packaging/build-archive.sh "${{ steps.version.outputs.version }}" target/release dist
+
+      - name: Package the AppImage
+        run: packaging/appimage/build.sh "${{ steps.version.outputs.version }}" target/release dist
+
+      - name: Checksums
+        run: cd dist && sha256sum -- *.tar.gz *.AppImage > SHA256SUMS && cat SHA256SUMS
+
+      - name: Extract changelog section
+        run: |
+          scripts/release-notes.sh "${{ steps.version.outputs.version }}" > release-notes.md
+          test -s release-notes.md || { echo "no changelog section"; exit 1; }
+          {
+            echo ""
+            echo "---"
+            echo "[Full changelog](${{ github.server_url }}/${{ github.repository }}/blob/main/CHANGELOG.md)"
+          } >> release-notes.md
+
+      - name: Check the version isn't released yet
+        id: gate
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null; then
+            echo "::notice::already released; bump the version to publish a new one"
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Draft release
+        if: steps.gate.outputs.released == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body_path: release-notes.md
+          files: |
+            dist/tt500-lcd-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
+            dist/TT500-LCD-${{ steps.version.outputs.version }}-x86_64.AppImage
+            dist/SHA256SUMS

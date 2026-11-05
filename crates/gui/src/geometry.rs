@@ -2,8 +2,21 @@
 
 use tt500_lcd_ipc::{Crop, Fit, Size};
 
-/// Panel aspect ratio (480:128).
+/// Panel aspect ratio (480:128) of the upright picture at rotation steps 0 and 2.
 pub const PANEL_ASPECT: f64 = 480.0 / 128.0;
+
+/// Aspect ratio (128:480) of the upright picture at the portrait steps 1 and 3.
+pub const PORTRAIT_ASPECT: f64 = 128.0 / 480.0;
+
+/// The aspect ratio of the picture as seen on the mounted panel at rotation `step`.
+#[must_use]
+pub fn panel_aspect(step: u8) -> f64 {
+    if step % 2 == 1 {
+        PORTRAIT_ASPECT
+    } else {
+        PANEL_ASPECT
+    }
+}
 
 /// Narrowest crop the editor allows, in source pixels (8x magnification on the panel).
 pub const MIN_CROP_WIDTH: f64 = 60.0;
@@ -26,20 +39,23 @@ pub struct Rect {
 pub struct CropView {
     src_w: f64,
     src_h: f64,
+    aspect: f64,
     zoom: f64,
     cx: f64,
     cy: f64,
 }
 
 impl CropView {
-    /// Zoom 1, centred. Source dimensions below 1 are raised to 1.
+    /// Zoom 1, centred, for a panel of `aspect` (width / height). Source dimensions below 1
+    /// are raised to 1.
     #[must_use]
-    pub fn new(size: Size) -> Self {
+    pub fn new(size: Size, aspect: f64) -> Self {
         let src_w = f64::from(size.width.max(1));
         let src_h = f64::from(size.height.max(1));
         let mut view = Self {
             src_w,
             src_h,
+            aspect,
             zoom: 1.0,
             cx: src_w / 2.0,
             cy: src_h / 2.0,
@@ -50,8 +66,8 @@ impl CropView {
 
     /// The view showing `crop` (the daemon's content), clamped to the source.
     #[must_use]
-    pub fn from_crop(size: Size, crop: Crop) -> Self {
-        let mut view = Self::new(size);
+    pub fn from_crop(size: Size, crop: Crop, aspect: f64) -> Self {
+        let mut view = Self::new(size, aspect);
         view.zoom = view.base().0 / f64::from(crop.width.max(1));
         view.cx = f64::from(crop.x) + f64::from(crop.width) / 2.0;
         view.cy = f64::from(crop.y) + f64::from(crop.height) / 2.0;
@@ -59,12 +75,30 @@ impl CropView {
         view
     }
 
-    /// The largest `PANEL_ASPECT` rectangle inside the source.
+    /// The panel aspect ratio this view crops to.
+    #[must_use]
+    pub fn aspect(&self) -> f64 {
+        self.aspect
+    }
+
+    /// The same source and centre for a panel of another `aspect`, at zoom 1.
+    #[must_use]
+    pub fn with_aspect(self, aspect: f64) -> Self {
+        let mut view = Self {
+            aspect,
+            zoom: 1.0,
+            ..self
+        };
+        view.clamp();
+        view
+    }
+
+    /// The largest panel-shaped rectangle inside the source.
     fn base(&self) -> (f64, f64) {
-        if self.src_w / self.src_h >= PANEL_ASPECT {
-            (self.src_h * PANEL_ASPECT, self.src_h)
+        if self.src_w / self.src_h >= self.aspect {
+            (self.src_h * self.aspect, self.src_h)
         } else {
-            (self.src_w, self.src_w / PANEL_ASPECT)
+            (self.src_w, self.src_w / self.aspect)
         }
     }
 
@@ -142,7 +176,7 @@ impl CropView {
         let max_h = self.src_h as u32;
         let (vw, _) = self.visible_size();
         let width = (vw.round() as u32).clamp(1, max_w);
-        let height = ((f64::from(width) / PANEL_ASPECT).round() as u32).clamp(1, max_h);
+        let height = ((f64::from(width) / self.aspect).round() as u32).clamp(1, max_h);
         let x = ((self.cx - f64::from(width) / 2.0).round().max(0.0) as u32).min(max_w - width);
         let y = ((self.cy - f64::from(height) / 2.0).round().max(0.0) as u32).min(max_h - height);
         Crop {
@@ -207,16 +241,22 @@ mod tests {
     #[test]
     fn initial_crops() {
         assert_eq!(
-            CropView::new(size(1920, 1080)).crop(),
+            CropView::new(size(1920, 1080), PANEL_ASPECT).crop(),
             crop(0, 284, 1920, 512)
         );
-        assert_eq!(CropView::new(size(480, 128)).crop(), crop(0, 0, 480, 128));
-        assert_eq!(CropView::new(size(100, 10)).crop(), crop(31, 0, 38, 10));
+        assert_eq!(
+            CropView::new(size(480, 128), PANEL_ASPECT).crop(),
+            crop(0, 0, 480, 128)
+        );
+        assert_eq!(
+            CropView::new(size(100, 10), PANEL_ASPECT).crop(),
+            crop(31, 0, 38, 10)
+        );
     }
 
     #[test]
     fn portrait_uses_full_width() {
-        let c = CropView::new(size(1080, 1920)).crop();
+        let c = CropView::new(size(1080, 1920), PANEL_ASPECT).crop();
         assert_eq!((c.width, c.height), (1080, 288));
         assert_eq!(c.x, 0);
         assert_eq!(c.y, 816);
@@ -224,7 +264,7 @@ mod tests {
 
     #[test]
     fn zoom_at_keeps_the_anchored_point() {
-        let mut view = CropView::new(size(1920, 1080));
+        let mut view = CropView::new(size(1920, 1080), PANEL_ASPECT);
         let anchor = (0.25, 0.4);
         let before = view.visible();
         let point = (
@@ -240,7 +280,7 @@ mod tests {
 
     #[test]
     fn panning_clamps_at_the_edges() {
-        let mut view = CropView::new(size(1920, 1080));
+        let mut view = CropView::new(size(1920, 1080), PANEL_ASPECT);
         view.set_zoom(4.0);
         view.pan_by(1.0e6, 1.0e6, 480.0);
         let v = view.visible();
@@ -253,7 +293,7 @@ mod tests {
 
     #[test]
     fn drag_moves_the_image_with_the_pointer() {
-        let mut view = CropView::new(size(1920, 1080));
+        let mut view = CropView::new(size(1920, 1080), PANEL_ASPECT);
         view.set_zoom(2.0);
         let before = view.visible();
         view.pan_by(48.0, 0.0, 480.0);
@@ -263,25 +303,36 @@ mod tests {
 
     #[test]
     fn zoom_is_clamped() {
-        let mut view = CropView::new(size(1920, 1080));
+        let mut view = CropView::new(size(1920, 1080), PANEL_ASPECT);
         view.set_zoom(0.1);
         assert!(close(view.zoom(), 1.0));
         view.set_zoom(1.0e6);
         assert!(close(view.zoom(), 1920.0 / MIN_CROP_WIDTH));
         assert_eq!(view.crop().width, 60);
-        let mut small = CropView::new(size(60, 16));
+        let mut small = CropView::new(size(60, 16), PANEL_ASPECT);
         small.set_zoom(5.0);
         assert!(close(small.zoom(), 1.0));
     }
 
     #[test]
+    fn portrait_view_crops_a_tall_window() {
+        let view = CropView::new(size(1920, 1080), PORTRAIT_ASPECT);
+        let c = view.crop();
+        assert_eq!((c.width, c.height), (288, 1080));
+        assert_eq!(c.x, (1920 - 288) / 2);
+        let again = view.with_aspect(PANEL_ASPECT).crop();
+        assert_eq!((again.width, again.height), (1920, 512));
+        assert!(close(panel_aspect(1), PORTRAIT_ASPECT) && close(panel_aspect(2), PANEL_ASPECT));
+    }
+
+    #[test]
     fn from_crop_round_trips() {
         let src = size(1920, 1080);
-        let mut view = CropView::new(src);
+        let mut view = CropView::new(src, PANEL_ASPECT);
         view.zoom_at(3.0, (0.7, 0.2));
         view.pan_by(-30.0, 12.0, 480.0);
         let crop = view.crop();
-        assert_eq!(CropView::from_crop(src, crop).crop(), crop);
+        assert_eq!(CropView::from_crop(src, crop, PANEL_ASPECT).crop(), crop);
     }
 
     #[test]

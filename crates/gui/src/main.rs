@@ -6,8 +6,10 @@ mod daemon;
 mod geometry;
 mod media;
 mod playback;
+mod profiles;
 mod settings;
 mod state;
+mod tray;
 mod ui;
 mod upload;
 
@@ -28,7 +30,7 @@ fn main() -> ExitCode {
             println!("TT500 LCD {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Ok(cli::Command::Run) => run(),
+        Ok(cli::Command::Run { hidden }) => run(hidden),
         Err(error) => {
             eprintln!("tt500-lcd-gui: {error}\nTry 'tt500-lcd-gui --help' for more information.");
             ExitCode::from(2)
@@ -36,7 +38,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> ExitCode {
+fn run(hidden: bool) -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -45,9 +47,13 @@ fn run() -> ExitCode {
         .init();
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| ui::icons::install());
-    app.connect_activate(ui::window::present);
+    // Only the first activation honours `--hidden`; a later launch should show the window.
+    let start_hidden = std::cell::Cell::new(hidden);
+    app.connect_activate(move |app| ui::window::present(app, start_hidden.replace(false)));
     // The command line was parsed above; GTK must not parse it again.
     let code = app.run_with_args::<&str>(&[]);
+    // The bus name is free again, so a restart after an update can start the new copy.
+    ui::spawn_pending_relaunch();
     if code == gtk::glib::ExitCode::SUCCESS {
         ExitCode::SUCCESS
     } else {

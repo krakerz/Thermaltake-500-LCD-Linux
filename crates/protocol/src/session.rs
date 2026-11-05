@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 
 use crate::packet::{
     BRIGHTNESS_ECHO_FRAMES, FrameMarker, STARTUP_0C, STARTUP_1A, STARTUP_1D, STARTUP_18,
-    brightness_command, packets,
+    brightness_command, packets, rotation_command,
 };
 use crate::{
-    BootAnimation, Brightness, FeatureQuery, FeatureReply, Frame, HEIGHT, StandbyImage, Transport,
-    TransportError, WIDTH,
+    BootAnimation, Brightness, FeatureQuery, FeatureReply, Frame, HEIGHT, Rotation, StandbyImage,
+    Transport, TransportError, WIDTH,
 };
 
 /// How often GET 0x0d is polled during a boot-animation upload, as in the capture.
@@ -91,6 +91,17 @@ impl<T: Transport> Panel<T> {
         self.transport
             .set_feature(&brightness_command(brightness))?;
         self.echo = Some((brightness, BRIGHTNESS_ECHO_FRAMES));
+        Ok(())
+    }
+
+    /// Sends `03 1d NN`, the rotation step TT RGB Plus sends from its rotate buttons.
+    /// Streaming continues with unchanged 480x128 frames; the on-panel effect of 1 to 3
+    /// is panel-defined.
+    ///
+    /// # Errors
+    /// [`SessionError::Transport`] if the report cannot be sent.
+    pub fn set_rotation(&mut self, rotation: Rotation) -> Result<(), SessionError> {
+        self.transport.set_feature(&rotation_command(rotation))?;
         Ok(())
     }
 
@@ -426,6 +437,11 @@ mod tests {
         panel
             .set_brightness(Brightness::try_from(0).unwrap())
             .unwrap();
+        for step in [1, 2, 3, 0] {
+            panel
+                .set_rotation(Rotation::try_from(step).unwrap())
+                .unwrap();
+        }
         let small = frame();
         let big = Frame::from_jpeg(sample_jpeg(2500)).unwrap();
         for i in 0..12 {
@@ -444,7 +460,10 @@ mod tests {
 
         let sent = log.snapshot();
         // Boot: all packets, 4 polls of GET 0x0d, then GET 0x0f.
-        assert_eq!(sent.len(), 8 + 2 + (11 + 3) + 2 + 6 + boot_packets + 4 + 1);
+        assert_eq!(
+            sent.len(),
+            8 + 2 + 4 + (11 + 3) + 2 + 6 + boot_packets + 4 + 1
+        );
         for item in sent {
             let ok = match &item {
                 Sent::SetFeature(b) => {
@@ -453,6 +472,11 @@ mod tests {
                             && b[0] == 0x03
                             && b[1] == 0x0c
                             && b[2] <= 0x64
+                            && b[3..].iter().all(|&x| x == 0))
+                        || (b.len() == 64
+                            && b[0] == 0x03
+                            && b[1] == 0x1d
+                            && b[2] <= 0x03
                             && b[3..].iter().all(|&x| x == 0))
                 }
                 Sent::GetFeature(id) => matches!(id, 0x07 | 0x0a | 0x0d | 0x0f | 0x10),

@@ -9,27 +9,34 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use image::RgbaImage;
 use tt500_lcd_ipc::{
-    ContentInfo, ContentKind, DEFAULT_FPS, Fit, LiveSource, MAX_FPS, PreviewReply, Request,
-    ShowLiveParams, Status,
+    ContentInfo, ContentKind, DEFAULT_FPS, DESKTOP_MAX_HEIGHT, DESKTOP_MAX_SCALE,
+    DESKTOP_MAX_WIDTH, DESKTOP_MIN_HEIGHT, DESKTOP_MIN_WIDTH, Fit, LiveSource, MAX_FPS,
+    PreviewReply, Request, ShowLiveParams, Size, Status,
 };
 
 use super::context::{Context, page_scroller, weak_call};
 use super::crop_panel::CropPanel;
 use super::icons::{self, icon};
 use crate::area::{
-    ApplyMode, AreaSource, DEFAULT_PRESET, Form, PRESETS, PreviewStep, PreviewTracker, apply_mode,
-    can_add_command, preset_index,
+    ApplyMode, AreaSource, CUSTOM_LABEL, Form, Geometry, PRESETS, PreviewStep, PreviewTracker,
+    SizeChoice, apply_mode, can_add_command, matches_panel_shape,
 };
 use crate::daemon;
 use crate::settings::{self, GuiSettings};
+use crate::state::Framing;
 
 /// Time between preview requests while the page is visible.
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(250);
+/// Shown under the crop editor while the whole source fits the panel.
+const ZOOM_HINT: &str = "Zoom in to choose a region — at 1× the whole desktop fits the panel";
+/// Zoom at or below this counts as "1×" for the hint.
+const HINT_MAX_ZOOM: f64 = 1.01;
 const COMMAND_TITLE: &str = "Command, e.g. alacritty -e ~/Scripts/sysmon.sh";
 /// Source row entries, in [`AreaSource`] order of this list.
-const SOURCES: [(&str, AreaSource); 2] = [
+const SOURCES: [(&str, AreaSource); 3] = [
     ("Virtual desktop", AreaSource::Desktop),
     ("Screen", AreaSource::Screen),
+    ("Window or screen (portal)", AreaSource::Portal),
 ];
 
 type Preview = Result<Option<(PreviewReply, RgbaImage)>, String>;
@@ -39,8 +46,14 @@ struct Inner {
     panel: CropPanel,
     source_row: adw::ComboRow,
     output_row: adw::ComboRow,
+    choose_row: adw::ActionRow,
+    choose_button: gtk::Button,
     outputs: gtk::StringList,
     size_row: adw::ComboRow,
+    width_row: adw::SpinRow,
+    height_row: adw::SpinRow,
+    scale_row: adw::SpinRow,
+    hint: gtk::Label,
     commands_group: adw::PreferencesGroup,
     add_button: gtk::Button,
     command_rows: RefCell<Vec<adw::EntryRow>>,
@@ -74,7 +87,7 @@ impl AreaPage {
 
         let source_row = adw::ComboRow::builder()
             .title("Source")
-            .subtitle("Screen or window through the portal: later")
+            .subtitle("The portal asks once which window or screen to share")
             .model(&gtk::StringList::new(&SOURCES.map(|(label, _)| label)))
             .build();
         let outputs = gtk::StringList::new(&[]);
@@ -82,15 +95,54 @@ impl AreaPage {
             .title("Monitor")
             .model(&outputs)
             .build();
+        let choose_button = gtk::Button::builder()
+            .label("Choose again…")
+            .valign(gtk::Align::Center)
+            .build();
+        let choose_row = adw::ActionRow::builder()
+            .title("Shared window or screen")
+            .subtitle("Remembered after the first choice; pick another one here")
+            .visible(false)
+            .build();
+        choose_row.add_suffix(&choose_button);
         let size_row = adw::ComboRow::builder()
             .title("Desktop size")
             .subtitle("The panel is 15:4; scale 2 draws at half the size")
-            .model(&gtk::StringList::new(&PRESETS.map(|preset| preset.label)))
+            .model(&gtk::StringList::new(&preset_labels()))
+            .build();
+        let width_row = size_spin(
+            "Width",
+            "In pixels, even",
+            DESKTOP_MIN_WIDTH,
+            DESKTOP_MAX_WIDTH,
+        );
+        let height_row = size_spin(
+            "Height",
+            "In pixels, even; taller than 15:4 pans vertically",
+            DESKTOP_MIN_HEIGHT,
+            DESKTOP_MAX_HEIGHT,
+        );
+        let scale_row = size_spin(
+            "Scale",
+            "Output scale factor",
+            1,
+            u32::from(DESKTOP_MAX_SCALE),
+        );
+        let hint = gtk::Label::builder()
+            .label(ZOOM_HINT)
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(["dim-label"])
+            .visible(false)
             .build();
         let source_group = adw::PreferencesGroup::builder().title("Source").build();
         source_group.add(&source_row);
         source_group.add(&output_row);
+        source_group.add(&choose_row);
         source_group.add(&size_row);
+        source_group.add(&width_row);
+        source_group.add(&height_row);
+        source_group.add(&scale_row);
 
         let add_button = gtk::Button::builder()
             .label("Add Command")
@@ -150,6 +202,7 @@ impl AreaPage {
             source_group.upcast_ref(),
             commands_group.upcast_ref(),
             panel.widget().upcast_ref(),
+            hint.upcast_ref(),
             panel.picture_group().upcast_ref(),
             buttons.upcast_ref(),
         ]);
@@ -159,8 +212,14 @@ impl AreaPage {
             panel,
             source_row,
             output_row,
+            choose_row,
+            choose_button,
             outputs,
             size_row,
+            width_row,
+            height_row,
+            scale_row,
+            hint,
             commands_group,
             add_button,
             command_rows: RefCell::new(Vec::new()),
@@ -183,20 +242,27 @@ impl AreaPage {
         inner
             .source_row
             .connect_selected_notify(move |_| handler(()));
-        let handler = weak_call(&weak, |inner, ()| inner.save_settings());
+        let handler = weak_call(&weak, |inner, ()| inner.size_changed());
         inner.size_row.connect_selected_notify(move |_| handler(()));
+        for row in [&inner.width_row, &inner.height_row, &inner.scale_row] {
+            let handler = weak_call(&weak, |inner, ()| inner.save_settings());
+            row.connect_value_notify(move |_| handler(()));
+        }
         let handler = weak_call(&weak, |inner, ()| inner.steady_toggled());
         inner.steady_row.connect_active_notify(move |_| handler(()));
         let handler = weak_call(&weak, |inner, ()| inner.add_command_row(""));
         inner.add_button.connect_clicked(move |_| handler(()));
         let handler = weak_call(&weak, |inner, ()| inner.apply());
         inner.apply_button.connect_clicked(move |_| handler(()));
+        let handler = weak_call(&weak, |inner, ()| inner.choose_again());
+        inner.choose_button.connect_clicked(move |_| handler(()));
         let handler = weak_call(&weak, |inner, ()| inner.stop());
         inner.stop_button.connect_clicked(move |_| handler(()));
 
         let weak = Rc::downgrade(&inner);
         glib::timeout_add_local(PREVIEW_INTERVAL, move || match weak.upgrade() {
             Some(inner) => {
+                inner.update_hint();
                 inner.poll_preview();
                 glib::ControlFlow::Continue
             }
@@ -207,6 +273,18 @@ impl AreaPage {
 
     pub fn widget(&self) -> &gtk::ScrolledWindow {
         &self.inner.scroller
+    }
+
+    /// Refills the controls from the daemon's live source on the next refresh (after a profile
+    /// was activated).
+    pub fn readopt(&self) {
+        self.inner.adopted.set(false);
+        self.inner.reset_preview();
+    }
+
+    /// Lays the editor out for the panel at rotation `step`.
+    pub fn set_rotation(&self, step: u8) {
+        self.inner.panel.set_rotation(step);
     }
 
     /// Redraws what depends on the daemon's status. Returns `true` when the controls were just
@@ -258,6 +336,45 @@ fn clamp_fps(value: f64) -> u32 {
     fps
 }
 
+/// Size row entries: the presets, then "Custom…".
+fn preset_labels() -> Vec<&'static str> {
+    PRESETS
+        .iter()
+        .map(|preset| preset.label)
+        .chain([CUSTOM_LABEL])
+        .collect()
+}
+
+/// A whole-number spin row for the custom size.
+fn size_spin(title: &str, subtitle: &str, min: u32, max: u32) -> adw::SpinRow {
+    let row = adw::SpinRow::new(
+        Some(&gtk::Adjustment::new(
+            f64::from(min),
+            f64::from(min),
+            f64::from(max),
+            if max > 100 { 2.0 } else { 1.0 },
+            10.0,
+            0.0,
+        )),
+        1.0,
+        0,
+    );
+    row.set_title(title);
+    row.set_subtitle(subtitle);
+    row.set_visible(false);
+    row
+}
+
+fn spin_value(row: &adw::SpinRow) -> u32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the adjustment keeps the value within u32 range"
+    )]
+    let value = row.value().round().max(0.0) as u32;
+    value
+}
+
 /// Connector names of the session's monitors.
 fn monitor_names() -> Vec<String> {
     let Some(display) = gdk::Display::default() else {
@@ -278,13 +395,79 @@ impl Inner {
         self.syncing.set(true);
         let settings = self.settings.borrow().clone();
         self.set_outputs(&monitor_names(), None);
-        let preset =
-            preset_index(settings.desktop_size, settings.desktop_scale).unwrap_or(DEFAULT_PRESET);
-        self.size_row
-            .set_selected(u32::try_from(preset).unwrap_or(0));
+        let custom = Geometry {
+            size: settings.custom_size,
+            scale: settings.custom_scale,
+        };
+        let choice = SizeChoice::from_geometry(Geometry {
+            size: settings.desktop_size,
+            scale: settings.desktop_scale,
+        });
+        self.show_size(choice, custom);
         self.set_command_rows(&settings.desktop_commands);
         self.show_source_groups();
         self.syncing.set(false);
+    }
+
+    /// Selects `choice` in the size row and fills the custom rows (`custom` unless the choice
+    /// is itself custom).
+    fn show_size(&self, choice: SizeChoice, custom: Geometry) {
+        let before = self.syncing.replace(true);
+        let shown = match choice {
+            SizeChoice::Custom(geometry) => geometry,
+            SizeChoice::Preset(_) => custom,
+        };
+        self.width_row.set_value(f64::from(shown.size.width));
+        self.height_row.set_value(f64::from(shown.size.height));
+        self.scale_row.set_value(f64::from(shown.scale));
+        self.size_row
+            .set_selected(u32::try_from(choice.row_index()).unwrap_or(0));
+        self.syncing.set(before);
+        self.show_custom_rows();
+    }
+
+    /// The custom width, height and scale rows, only while "Custom…" is selected.
+    fn show_custom_rows(&self) {
+        let desktop = self.source() == AreaSource::Desktop;
+        let custom = self.size_choice().row_index() >= PRESETS.len();
+        for row in [&self.width_row, &self.height_row, &self.scale_row] {
+            row.set_visible(desktop && custom);
+        }
+    }
+
+    /// The custom rows as a [`Geometry`].
+    fn custom_geometry(&self) -> Geometry {
+        Geometry {
+            size: Size {
+                width: spin_value(&self.width_row),
+                height: spin_value(&self.height_row),
+            },
+            scale: u8::try_from(spin_value(&self.scale_row)).unwrap_or(1),
+        }
+    }
+
+    /// The size row as a [`SizeChoice`].
+    fn size_choice(&self) -> SizeChoice {
+        let index = usize::try_from(self.size_row.selected()).unwrap_or(0);
+        SizeChoice::from_row_index(index, self.custom_geometry())
+    }
+
+    fn size_changed(&self) {
+        if self.syncing.get() {
+            return;
+        }
+        self.show_custom_rows();
+        self.save_settings();
+    }
+
+    /// Shows the zoom hint while a 15:4 source is framed by crop at 1×.
+    fn update_hint(&self) {
+        let show = self.panel.framed().is_some_and(|framed| {
+            framed.framing == Framing::Crop
+                && matches_panel_shape(framed.size)
+                && framed.view.zoom() <= HINT_MAX_ZOOM
+        });
+        self.hint.set_visible(show);
     }
 
     /// Output row entries: "Primary", then `names`; selects `selected` (or Primary).
@@ -376,8 +559,12 @@ impl Inner {
     fn show_source_groups(&self) {
         let desktop = self.source() == AreaSource::Desktop;
         self.size_row.set_visible(desktop);
+        self.show_custom_rows();
         self.commands_group.set_visible(desktop);
-        self.output_row.set_visible(!desktop);
+        self.output_row
+            .set_visible(self.source() == AreaSource::Screen);
+        self.choose_row
+            .set_visible(self.source() == AreaSource::Portal);
         self.show_steady();
     }
 
@@ -418,7 +605,7 @@ impl Inner {
             source: self.source(),
             output,
             commands: self.rows_text(),
-            preset: Some(usize::try_from(self.size_row.selected()).unwrap_or(DEFAULT_PRESET)),
+            size: self.size_choice(),
         }
     }
 
@@ -430,15 +617,29 @@ impl Inner {
         if self.syncing.get() {
             return;
         }
-        let preset = usize::try_from(self.size_row.selected())
-            .ok()
-            .and_then(|index| PRESETS.get(index))
-            .unwrap_or(&PRESETS[DEFAULT_PRESET]);
+        let choice = self.size_choice();
+        let chosen = choice.geometry();
+        let custom = match choice {
+            SizeChoice::Custom(geometry) => geometry,
+            SizeChoice::Preset(_) => {
+                let settings = self.settings.borrow();
+                Geometry {
+                    size: settings.custom_size,
+                    scale: settings.custom_scale,
+                }
+            }
+        };
         let settings = GuiSettings {
             desktop_commands: crate::area::clean_commands(&self.rows_text()),
-            desktop_size: preset.size,
-            desktop_scale: preset.scale,
+            desktop_size: chosen.size,
+            desktop_scale: chosen.scale,
+            custom_size: custom.size,
+            custom_scale: custom.scale,
             steady: self.steady_choice.get(),
+            preview: settings::preview(),
+            keep_in_tray: settings::keep_in_tray(),
+            check_updates: settings::check_updates(),
+            last_update_check: settings::last_update_check(),
         };
         if *self.settings.borrow() == settings {
             return;
@@ -480,14 +681,19 @@ impl Inner {
         match form.source {
             AreaSource::Desktop => {
                 self.set_command_rows(&form.commands);
-                if let Some(preset) = form.preset {
-                    self.size_row
-                        .set_selected(u32::try_from(preset).unwrap_or(0));
-                }
+                let custom = {
+                    let settings = self.settings.borrow();
+                    Geometry {
+                        size: settings.custom_size,
+                        scale: settings.custom_scale,
+                    }
+                };
+                self.show_size(form.size, custom);
             }
             AreaSource::Screen => {
                 self.set_outputs(&monitor_names(), form.output.as_deref());
             }
+            AreaSource::Portal => {}
         }
         if let Some(fps) = info.max_fps.or(info.fps) {
             self.fps_row.set_value(f64::from(fps));
@@ -522,6 +728,22 @@ impl Inner {
                 source,
                 fit,
                 crop,
+                fps: Some(self.fps()),
+                steady: self.steady_choice.get(),
+            }),
+            "Sent to the panel",
+        );
+    }
+
+    /// Starts the portal source again with its picker, dropping the remembered choice.
+    fn choose_again(&self) {
+        self.reset_preview();
+        self.adopted.set(true);
+        self.ctx.send(
+            Request::ShowLive(ShowLiveParams {
+                source: LiveSource::Portal { reselect: true },
+                fit: Fit::Cover,
+                crop: None,
                 fps: Some(self.fps()),
                 steady: self.steady_choice.get(),
             }),

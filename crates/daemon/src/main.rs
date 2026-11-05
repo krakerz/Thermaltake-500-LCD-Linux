@@ -5,26 +5,34 @@ mod boot;
 mod dirs;
 mod hub;
 mod live;
+mod profiles;
 mod server;
 mod standby;
 mod store;
 mod streamer;
 
 use std::env;
-use std::process::ExitCode;
+use std::fs;
+use std::path::Path;
+use std::process::{self, ExitCode};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 use tracing_subscriber::EnvFilter;
 use tt500_lcd_ipc::{DeviceState, IPC_VERSION, ShowLiveParams, Status};
-use tt500_lcd_protocol::Brightness;
+use tt500_lcd_protocol::{Brightness, Rotation};
 
 use crate::args::{Command as Cli, DeviceMode};
 use crate::dirs::Dirs;
 use crate::hub::StatusHub;
+use crate::profiles::ProfileHub;
+use crate::profiles::scheduler::Scheduler;
+use crate::profiles::sources::{LocalClock, ProcFs};
 use crate::server::ServerContext;
 use crate::store::{ContentStore, Restored};
 use crate::streamer::{Command, Connector, Core, HidConnector, NullConnector};
@@ -32,6 +40,10 @@ use crate::streamer::{Command, Connector, Core, HidConnector, NullConnector};
 /// How often a stored live source is started again at login, and how far apart.
 const RESTORE_TRIES: u32 = 12;
 const RESTORE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// The whole shutdown after a signal; past this the process exits anyway.
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+/// How long shutdown waits for the streamer to drop its source and close the panel.
+const STREAMER_STOP_WAIT: Duration = Duration::from_millis(4500);
 
 fn main() -> ExitCode {
     match args::parse(env::args_os()) {
@@ -72,9 +84,12 @@ fn init_logging() {
 }
 
 fn run(mode: DeviceMode) -> Result<()> {
+    // Registered before anything is spawned, so a signal is never lost to the default action.
+    let mut signals = Signals::new([SIGINT, SIGTERM]).context("cannot install signal handlers")?;
     let dirs = Dirs::new()?;
     let store = ContentStore::new(dirs.clone());
     let brightness = store.brightness();
+    let rotation = store.rotation();
     let listener = server::bind(&dirs.socket)?;
 
     let status = Arc::new(StatusHub::new(Status {
@@ -83,16 +98,25 @@ fn run(mode: DeviceMode) -> Result<()> {
         device: DeviceState::Idle,
         content: None,
         brightness: brightness.get(),
+        rotation: Some(rotation.get()),
         content_error: None,
+        profile: None,
     }));
+    let profiles = ProfileHub::load(&dirs.state, Arc::clone(&status), || store.stored_spec());
     let (commands, receiver) = mpsc::channel();
     match mode {
         DeviceMode::Hardware => {
-            spawn_streamer(HidConnector::default, brightness, &status, receiver)?;
+            spawn_streamer(
+                HidConnector::default,
+                brightness,
+                rotation,
+                &status,
+                receiver,
+            )?;
         }
         DeviceMode::Null => {
             tracing::info!("--no-device: frames go to a null transport");
-            spawn_streamer(|| NullConnector, brightness, &status, receiver)?;
+            spawn_streamer(|| NullConnector, brightness, rotation, &status, receiver)?;
         }
     }
 
@@ -132,7 +156,10 @@ fn run(mode: DeviceMode) -> Result<()> {
         status,
         live: Mutex::new(None),
         run_dir,
+        profiles,
     });
+    // Sway and desktop commands of a daemon that was killed outright.
+    live::vdesktop::clean_leftovers(&ctx.run_dir);
     if let Some(params) = live_restore {
         let ctx = Arc::clone(&ctx);
         let generation = ctx.store.generation();
@@ -141,8 +168,58 @@ fn run(mode: DeviceMode) -> Result<()> {
             .spawn(move || restore_live(&ctx, &params, generation))
             .context("cannot spawn the live-restore thread")?;
     }
-    server::serve(&listener, &ctx);
+    {
+        let ctx = Arc::clone(&ctx);
+        thread::Builder::new()
+            .name("profile-scheduler".into())
+            .spawn(move || Scheduler::new(LocalClock, ProcFs).run(&ctx))
+            .context("cannot spawn the profile-scheduler thread")?;
+    }
+    {
+        let ctx = Arc::clone(&ctx);
+        thread::Builder::new()
+            .name("ipc-accept".into())
+            .spawn(move || server::serve(&listener, &ctx))
+            .context("cannot spawn the accept thread")?;
+    }
+    let signal = signals.forever().next().unwrap_or(SIGTERM);
+    shutdown(&ctx, &dirs.socket, signal);
     Ok(())
+}
+
+/// Stops the daemon cleanly: no new IPC, the live source (desktop, ffmpeg) and the panel are
+/// released by the streamer, the socket is removed. Bounded by [`SHUTDOWN_BUDGET`].
+fn shutdown(ctx: &ServerContext, socket: &Path, signal: i32) {
+    let name = match signal {
+        SIGINT => "SIGINT",
+        SIGTERM => "SIGTERM",
+        _ => "signal",
+    };
+    tracing::info!("shutting down ({name})");
+    let watchdog = thread::Builder::new()
+        .name("shutdown-watchdog".into())
+        .spawn(|| {
+            thread::sleep(SHUTDOWN_BUDGET);
+            tracing::error!("shutdown took more than {SHUTDOWN_BUDGET:?}; exiting anyway");
+            process::exit(1);
+        });
+    if let Err(err) = watchdog {
+        tracing::warn!("cannot spawn the shutdown watchdog: {err}");
+    }
+    ctx.profiles.stop();
+    // New connections fail from here on.
+    if let Err(err) = fs::remove_file(socket) {
+        tracing::warn!("cannot remove {}: {err}", socket.display());
+    }
+    // Drop our handle on the live source, then have the streamer drop its own and close the
+    // panel; the reply comes once that is done.
+    *ctx.live.lock().expect("lock poisoned") = None;
+    let (reply, stopped) = mpsc::channel();
+    if ctx.commands.send(Command::Clear { reply }).is_ok()
+        && stopped.recv_timeout(STREAMER_STOP_WAIT).is_err()
+    {
+        tracing::warn!("the streamer did not stop in time");
+    }
 }
 
 /// Tries to start the stored live source again; the screen or compositor may not be up yet
@@ -176,6 +253,7 @@ fn restore_live(ctx: &ServerContext, params: &ShowLiveParams, generation: u64) {
 fn spawn_streamer<C, F>(
     make_connector: F,
     brightness: Brightness,
+    rotation: Rotation,
     status: &Arc<StatusHub>,
     commands: Receiver<Command>,
 ) -> Result<()>
@@ -187,7 +265,7 @@ where
     thread::Builder::new()
         .name("streamer".into())
         .spawn(move || {
-            let core = Core::new(make_connector(), brightness, status);
+            let core = Core::new(make_connector(), brightness, rotation, status);
             streamer::run(core, &commands);
         })
         .context("cannot spawn the streamer thread")?;

@@ -124,10 +124,26 @@ impl CropPanel {
         &self.inner.editor
     }
 
+    /// Lays the editor out for the panel at rotation `step` (portrait for 1 and 3) and re-centres
+    /// the crop for the new shape. The picture stays upright, as on the mounted panel.
+    pub fn set_rotation(&self, step: u8) {
+        let inner = &self.inner;
+        inner.editor.set_rotation(step);
+        let framed = {
+            let mut state = inner.state.borrow_mut();
+            let Some(framed) = state.as_mut() else {
+                return;
+            };
+            framed.set_aspect(inner.editor.aspect());
+            *framed
+        };
+        inner.apply_to_editor(&framed);
+    }
+
     /// Shows `source` with a fresh, centred crop.
     pub fn set_source(&self, source: &media::Source) {
         let inner = &self.inner;
-        let framed = Framed::new(source.size);
+        let framed = Framed::new(source.size, inner.editor.aspect());
         inner.editor.set_source(source);
         *inner.state.borrow_mut() = Some(framed);
         inner.apply_to_editor(&framed);
@@ -234,7 +250,7 @@ impl Inner {
             Some(framed) => framed.size,
             None => return,
         };
-        let view = CropView::new(size);
+        let view = CropView::new(size, self.editor.aspect());
         self.editor.set_view(view);
         self.view_changed(view);
     }

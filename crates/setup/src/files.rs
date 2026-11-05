@@ -27,12 +27,24 @@ fn resolve_config_home(
     xdg.or(home).ok_or(SetupError::NoConfigHome)
 }
 
-/// Finds `name`: next to the running executable, else the first match on `PATH`.
+/// Finds `name`: the file named by `TT500_DAEMON` / `TT500_GUI` (set by the AppImage's
+/// `AppRun`, whose own directory is a temporary mount), else next to the running executable,
+/// else the first match on `PATH`.
 ///
 /// # Errors
 ///
 /// Returns [`SetupError::BinaryNotFound`] when it is in neither place.
 pub fn find_binary(name: &'static str) -> Result<PathBuf, SetupError> {
+    let pinned = match name {
+        crate::DAEMON_BINARY => env::var_os("TT500_DAEMON"),
+        crate::GUI_BINARY => env::var_os("TT500_GUI"),
+        _ => None,
+    }
+    .map(PathBuf::from)
+    .filter(|path| path.is_absolute() && path.is_file());
+    if let Some(path) = pinned {
+        return Ok(path);
+    }
     let exe_dir = env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));

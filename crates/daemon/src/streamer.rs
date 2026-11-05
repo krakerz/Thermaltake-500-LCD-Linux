@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use tt500_lcd_ipc::{ContentInfo, DeviceState, ErrorCode, IPC_VERSION, IpcError, Status};
 use tt500_lcd_protocol::{
     BootAnimation, Brightness, Discovery, FeatureCommand, FeatureQuery, FeatureReply, Frame,
-    HidTransport, KEEP_ALIVE_INTERVAL, OpenError, OutputPacket, Panel, STILL_REFRESH, SessionError,
-    StandbyImage, StatusReply, Transport, TransportError,
+    HidTransport, KEEP_ALIVE_INTERVAL, OpenError, OutputPacket, Panel, Rotation, STILL_REFRESH,
+    SessionError, StandbyImage, StatusReply, Transport, TransportError,
 };
 use tt500_lcd_render::{Playlist, TimedFrame, VideoPoll, VideoStream};
 
@@ -160,6 +160,10 @@ pub trait FrameStream: Send + fmt::Debug {
     fn problem(&self) -> Option<String> {
         None
     }
+    /// Whether a frame identical to the last one sent may be skipped (video files only).
+    fn skips_repeats(&self) -> bool {
+        false
+    }
 }
 
 impl FrameStream for VideoStream {
@@ -173,6 +177,10 @@ impl FrameStream for VideoStream {
 
     fn frame_interval(&self) -> Duration {
         Self::frame_interval(self)
+    }
+
+    fn skips_repeats(&self) -> bool {
+        true
     }
 }
 
@@ -190,6 +198,11 @@ pub enum Command {
     /// Change the brightness (already persisted by the caller).
     SetBrightness {
         value: Brightness,
+        reply: Sender<Status>,
+    },
+    /// Change the rotation step (already persisted by the caller).
+    SetRotation {
+        value: Rotation,
         reply: Sender<Status>,
     },
     /// Upload a standby image to the panel's flash (already rendered and validated).
@@ -243,6 +256,11 @@ impl Source {
             stream,
             ended: false,
         }
+    }
+
+    /// Whether an unchanged frame may be skipped: video files, not stills or live captures.
+    fn skips_repeats(&self) -> bool {
+        matches!(self, Self::Video { stream, .. } if stream.skips_repeats())
     }
 
     /// The running stream's problem, if it reports one.
@@ -303,6 +321,9 @@ impl Source {
 struct Loaded {
     source: Source,
     info: ContentInfo,
+    /// The last frame sent and when; a stream's identical repeats are skipped until
+    /// `STILL_REFRESH` has passed.
+    last_sent: Option<(Frame, Instant)>,
 }
 
 /// Why opening the panel failed.
@@ -319,7 +340,8 @@ pub struct Core<C: Connector> {
     panel: Option<Panel<Logged<C::Transport>>>,
     content: Option<Loaded>,
     brightness: Brightness,
-    /// Idle only: when to open the panel briefly to apply the brightness.
+    rotation: Rotation,
+    /// Idle only: when to open the panel briefly to apply the brightness and rotation.
     idle_brightness_due: Option<Instant>,
     device: DeviceState,
     next_frame: Instant,
@@ -337,13 +359,19 @@ pub struct Core<C: Connector> {
 
 impl<C: Connector> Core<C> {
     /// Creates an idle core and publishes its status.
-    pub fn new(connector: C, brightness: Brightness, status: SharedStatus) -> Self {
+    pub fn new(
+        connector: C,
+        brightness: Brightness,
+        rotation: Rotation,
+        status: SharedStatus,
+    ) -> Self {
         let now = Instant::now();
         let core = Self {
             connector,
             panel: None,
             content: None,
             brightness,
+            rotation,
             idle_brightness_due: None,
             device: DeviceState::Idle,
             next_frame: now,
@@ -367,10 +395,12 @@ impl<C: Connector> Core<C> {
             device: self.device.clone(),
             content: self.content.as_ref().map(|c| c.info.clone()),
             brightness: self.brightness.get(),
+            rotation: Some(self.rotation.get()),
             content_error: self
                 .content_error
                 .clone()
                 .or_else(|| self.live_problem.clone()),
+            profile: None,
         };
         self.status.set(status);
     }
@@ -390,6 +420,7 @@ impl<C: Connector> Core<C> {
                 self.content = Some(Loaded {
                     source: Source::from(content),
                     info,
+                    last_sent: None,
                 });
                 self.blocked = None;
                 self.content_error = None;
@@ -419,6 +450,18 @@ impl<C: Connector> Core<C> {
                     }
                 } else if self.content.is_none() && self.idle_brightness_due.is_none() {
                     // Idle: `tick` opens the panel briefly; later changes ride along.
+                    self.idle_brightness_due = Some(now + IDLE_BRIGHTNESS_DELAY);
+                }
+                Some(reply)
+            }
+            Command::SetRotation { value, reply } => {
+                self.rotation = value;
+                if let Some(panel) = self.panel.as_mut() {
+                    if let Err(err) = panel.set_rotation(value) {
+                        self.fail_session(&err, now);
+                    }
+                } else if self.content.is_none() && self.idle_brightness_due.is_none() {
+                    // Idle: same brief open as for a brightness change.
                     self.idle_brightness_due = Some(now + IDLE_BRIGHTNESS_DELAY);
                 }
                 Some(reply)
@@ -532,9 +575,8 @@ impl<C: Connector> Core<C> {
                 "panel start-up failed: {err}; nothing was uploaded"
             ))
         })?;
-        // Same as every connect: re-apply the stored brightness after the start-up.
-        panel
-            .set_brightness(self.brightness)
+        // Same as every connect: re-apply the stored settings after the start-up.
+        apply_stored_settings(&mut panel, self.brightness, self.rotation)
             .and_then(|()| send(&mut panel))
             .map_err(|err| upload_failed(kind, &err))?;
         tracing::info!("{what} uploaded; panel closed again");
@@ -581,9 +623,17 @@ impl<C: Connector> Core<C> {
         }
         if now >= self.next_frame {
             let TimedFrame { frame, hold } = loaded.source.next_frame();
-            if let Err(err) = panel.send_frame(&frame) {
-                self.fail_session(&err, now);
-                return Some(self.next_scan);
+            let repeat = loaded.source.skips_repeats()
+                && loaded
+                    .last_sent
+                    .as_ref()
+                    .is_some_and(|(sent, at)| *sent == frame && now < *at + STILL_REFRESH);
+            if !repeat {
+                if let Err(err) = panel.send_frame(&frame) {
+                    self.fail_session(&err, now);
+                    return Some(self.next_scan);
+                }
+                loaded.last_sent = Some((frame, now));
             }
             self.next_frame += hold;
             if self.next_frame <= now {
@@ -616,8 +666,8 @@ impl<C: Connector> Core<C> {
             Ok(panel) => panel,
             Err(err) => return Err(self.connect_failed(err, now)),
         };
-        // Re-apply the stored brightness after every start-up.
-        if let Err(err) = panel.set_brightness(self.brightness) {
+        // Re-apply the stored brightness and rotation after every start-up.
+        if let Err(err) = apply_stored_settings(&mut panel, self.brightness, self.rotation) {
             return Err(self.connect_failed(ConnectError::Retry(err.to_string()), now));
         }
         tracing::info!("panel connected (firmware {})", panel.info().firmware);
@@ -627,6 +677,9 @@ impl<C: Connector> Core<C> {
         self.panel = Some(panel);
         self.last_error = None;
         self.last_keep_alive = None;
+        if let Some(loaded) = self.content.as_mut() {
+            loaded.last_sent = None;
+        }
         self.next_frame = now;
         self.next_keep_alive = now + KEEP_ALIVE_INTERVAL;
         self.publish();
@@ -668,33 +721,50 @@ impl<C: Connector> Core<C> {
         self.publish();
     }
 
-    /// Idle: once due, opens the panel, runs the start-up, sends the brightness and closes it
-    /// again (no frames).
+    /// Idle: once due, opens the panel, runs the start-up, sends the brightness and rotation
+    /// and closes it again (no frames).
     fn apply_idle_brightness(&mut self, now: Instant) -> Option<Instant> {
         let due = self.idle_brightness_due?;
         if now < due {
             return Some(due);
         }
         self.idle_brightness_due = None;
-        let brightness = self.brightness;
+        let (brightness, rotation) = (self.brightness, self.rotation);
         let result: Result<(), String> = self
             .connector
             .connect()
             .map_err(|err| err.to_string())
             .and_then(|transport| Panel::start(Logged(transport)).map_err(|err| err.to_string()))
             .and_then(|mut panel| {
-                panel
-                    .set_brightness(brightness)
+                apply_stored_settings(&mut panel, brightness, rotation)
                     .map_err(|err| err.to_string())
             });
         match result {
-            Ok(()) => tracing::info!("brightness {} applied while idle", brightness.get()),
+            Ok(()) => tracing::info!(
+                "brightness {} and rotation {} applied while idle",
+                brightness.get(),
+                rotation.get()
+            ),
             Err(err) => tracing::warn!(
                 "cannot apply the brightness while idle: {err}; it applies at the next show"
             ),
         }
         None
     }
+}
+
+/// Re-applies the stored settings after a start-up: the brightness always, the rotation only
+/// when it is not the start-up's own step 0.
+fn apply_stored_settings<T: Transport>(
+    panel: &mut Panel<T>,
+    brightness: Brightness,
+    rotation: Rotation,
+) -> Result<(), SessionError> {
+    panel.set_brightness(brightness)?;
+    if rotation != Rotation::default() {
+        panel.set_rotation(rotation)?;
+    }
+    Ok(())
 }
 
 /// What an upload writes to the panel's flash.
@@ -749,6 +819,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::Cursor;
     use std::sync::mpsc;
+    use std::thread;
 
     use tt500_lcd_protocol::mock::{MockLog, MockTransport, Sent};
     use tt500_lcd_render::RenderOptions;
@@ -816,15 +887,30 @@ mod tests {
     }
 
     fn core(connector: MockConnector, brightness: u8) -> Core<MockConnector> {
+        core_with_rotation(connector, brightness, 0)
+    }
+
+    fn core_with_rotation(
+        connector: MockConnector,
+        brightness: u8,
+        rotation: u8,
+    ) -> Core<MockConnector> {
         let status = Arc::new(StatusHub::new(Status {
             daemon_version: String::new(),
             ipc_version: 0,
             device: DeviceState::Idle,
             content: None,
             brightness: 0,
+            rotation: None,
             content_error: None,
+            profile: None,
         }));
-        Core::new(connector, Brightness::try_from(brightness).unwrap(), status)
+        Core::new(
+            connector,
+            Brightness::try_from(brightness).unwrap(),
+            Rotation::try_from(rotation).unwrap(),
+            status,
+        )
     }
 
     fn show(core: &mut Core<MockConnector>, playlist: Playlist, now: Instant) {
@@ -860,12 +946,39 @@ mod tests {
             },
             t0,
         );
+        // Let the decoder queue its frames so a lagging poll cannot repeat the first one.
+        thread::sleep(ms(100));
         // Three frames: the end of the stream cannot be observed within two polls.
         assert_eq!(core.tick(t0), Some(t0 + ms(70)));
         assert_eq!(core.tick(t0 + ms(70)), Some(t0 + ms(140)));
         assert_eq!(frame_markers(&log).len(), 2);
         clear(&mut core, t0 + ms(100));
         assert_eq!(core.tick(t0 + ms(140)), None);
+        assert_eq!(frame_markers(&log).len(), 2);
+    }
+
+    #[test]
+    fn identical_video_frames_are_sent_once_until_the_refresh() {
+        let (transport, log) = MockTransport::new();
+        let mut core = core(connector(vec![transport]), 100);
+        let t0 = Instant::now();
+        let (reply, _rx) = mpsc::channel();
+        // Every raw frame is the same grey, so every encoded frame is identical.
+        let raw = vec![90u8; 480 * 128 * 3 * 40];
+        let stream = VideoStream::from_raw_rgb(Cursor::new(raw), ms(70), 90).unwrap();
+        core.handle(
+            Command::Show {
+                content: Content::Video(stream),
+                info: info(),
+                reply,
+            },
+            t0,
+        );
+        for k in 0..5 {
+            core.tick(t0 + ms(70) * k);
+        }
+        assert_eq!(frame_markers(&log).len(), 1);
+        core.tick(t0 + STILL_REFRESH + ms(70));
         assert_eq!(frame_markers(&log).len(), 2);
     }
 
@@ -899,6 +1012,20 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    fn set_rotation(core: &mut Core<MockConnector>, value: u8, now: Instant) {
+        let (reply, _rx) = std::sync::mpsc::channel();
+        let value = Rotation::try_from(value).unwrap();
+        core.handle(Command::SetRotation { value, reply }, now);
+    }
+
+    fn set_1d(rotation: u8) -> Sent {
+        let mut bytes = vec![0u8; 64];
+        bytes[0] = 0x03;
+        bytes[1] = 0x1d;
+        bytes[2] = rotation;
+        Sent::SetFeature(bytes)
     }
 
     fn set_0c(brightness: u8) -> Sent {
@@ -1112,6 +1239,53 @@ mod tests {
         want.extend([0x1e; 8]);
         want.push(0xff);
         assert_eq!(frame_markers(&log), want);
+    }
+
+    #[test]
+    fn rotation_change_while_connected_is_immediate() {
+        let (transport, log) = MockTransport::new();
+        let mut core = core(connector(vec![transport]), 100);
+        let t0 = Instant::now();
+        show(&mut core, still(), t0);
+        core.tick(t0);
+        assert_eq!(core.snapshot().rotation, Some(0));
+        set_rotation(&mut core, 2, t0 + ms(10));
+        assert_eq!(log.snapshot().last(), Some(&set_1d(2)));
+        assert_eq!(core.snapshot().rotation, Some(2));
+    }
+
+    #[test]
+    fn stored_rotation_is_reapplied_after_startup_and_brightness() {
+        let (transport, log) = MockTransport::new();
+        let mut core = core_with_rotation(connector(vec![transport]), 70, 3);
+        let t0 = Instant::now();
+        show(&mut core, still(), t0);
+        core.tick(t0);
+        let sent = log.snapshot();
+        assert_eq!(sent[7], Sent::SetFeature(startup_1d()));
+        assert_eq!(sent[8], set_0c(70));
+        assert_eq!(sent[9], set_1d(3));
+    }
+
+    #[test]
+    fn idle_rotation_runs_startup_then_closes() {
+        let (transport, log) = MockTransport::new();
+        let mut core = core(connector(vec![transport]), 100);
+        let t0 = Instant::now();
+        set_rotation(&mut core, 1, t0);
+        assert_eq!(core.tick(t0), Some(t0 + IDLE_BRIGHTNESS_DELAY));
+        assert!(log.snapshot().is_empty());
+        assert_eq!(core.tick(t0 + IDLE_BRIGHTNESS_DELAY), None);
+        let sent = log.snapshot();
+        assert_eq!(sent.len(), 10);
+        assert_eq!(sent[8], set_0c(100));
+        assert_eq!(sent[9], set_1d(1));
+    }
+
+    fn startup_1d() -> Vec<u8> {
+        let mut bytes = vec![0u8; 64];
+        bytes[..9].copy_from_slice(&[0x03, 0x1d, 0x00, 0xff, 0xff, 0xea, 0xff, 0xff, 0xff]);
+        bytes
     }
 
     #[test]

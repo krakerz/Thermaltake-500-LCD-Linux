@@ -10,6 +10,7 @@ description = "Command-line control for the tt500-lcd daemon"
 [dependencies]
 tt500-lcd-ipc.workspace = true
 tt500-lcd-setup.workspace = true
+tt500-lcd-update.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

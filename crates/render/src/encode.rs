@@ -47,13 +47,13 @@ fn encode_within(
     Err(RenderError::TooComplex)
 }
 
-/// Encodes an arbitrary-sized preview image at quality 80 (not panel-constrained).
+/// Encodes an arbitrary-sized preview image at quality 85 (not panel-constrained).
 pub(crate) fn encode_preview(rgb: &RgbImage) -> Result<Vec<u8>, RenderError> {
     let too_big = || RenderError::Encode("preview image too large".to_owned());
     let width = u16::try_from(rgb.width()).map_err(|_| too_big())?;
     let height = u16::try_from(rgb.height()).map_err(|_| too_big())?;
     let mut out = Vec::with_capacity(32 * 1024);
-    Encoder::new(&mut out, 80)
+    Encoder::new(&mut out, 85)
         .encode(rgb.as_raw(), width, height, ColorType::Rgb)
         .map_err(|e| RenderError::Encode(e.to_string()))?;
     Ok(out)

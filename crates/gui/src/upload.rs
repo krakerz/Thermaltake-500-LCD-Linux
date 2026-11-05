@@ -164,10 +164,13 @@ mod tests {
     }
 
     fn framed() -> Framed {
-        Framed::new(Size {
-            width: 1920,
-            height: 1080,
-        })
+        Framed::new(
+            Size {
+                width: 1920,
+                height: 1080,
+            },
+            crate::geometry::PANEL_ASPECT,
+        )
     }
 
     #[test]

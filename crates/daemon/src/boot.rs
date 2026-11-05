@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use tt500_lcd_protocol::OutputPacket;
+use tt500_lcd_protocol::{OutputPacket, Rotation};
 use tt500_lcd_render::RenderedBoot;
 
 use crate::standby::DryRunFiles;
@@ -30,7 +30,11 @@ fn hex(packet: &OutputPacket) -> String {
 
 /// Writes the packets of `rendered` (raw, in send order) and a text summary into `dir`.
 /// Nothing is sent to the panel.
-pub fn write_boot_dry_run(dir: &Path, rendered: &RenderedBoot) -> io::Result<DryRunFiles> {
+pub fn write_boot_dry_run(
+    dir: &Path,
+    rendered: &RenderedBoot,
+    rotation: Rotation,
+) -> io::Result<DryRunFiles> {
     fs::create_dir_all(dir)?;
     let animation = &rendered.animation;
     let blocks = animation.blocks();
@@ -40,6 +44,7 @@ pub fn write_boot_dry_run(dir: &Path, rendered: &RenderedBoot) -> io::Result<Dry
         summary,
         "boot animation dry run: nothing was sent to the panel"
     );
+    let _ = writeln!(summary, "rotation: step {}", rotation.get());
     let _ = writeln!(summary, "frames: {}", animation.frame_count());
     let delay_ms = animation.frame_delay_ms();
     let _ = writeln!(
@@ -121,7 +126,7 @@ mod tests {
     fn dump_is_the_exact_packets() {
         let boot = rendered();
         let dir = tempfile::tempdir().unwrap();
-        let files = write_boot_dry_run(dir.path(), &boot).unwrap();
+        let files = write_boot_dry_run(dir.path(), &boot, Rotation::default()).unwrap();
         let raw = fs::read(&files.packets).unwrap();
         let want: Vec<u8> = boot
             .animation

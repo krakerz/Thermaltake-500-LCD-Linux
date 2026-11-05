@@ -1,9 +1,12 @@
 //! Video files: ffprobe for metadata, ffmpeg for decoding to raw 480x128 RGB frames.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
-use std::path::Path;
+use std::mem;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -11,9 +14,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use image::RgbImage;
-use tt500_lcd_protocol::{Frame, HEIGHT, MIN_FRAME_INTERVAL, WIDTH};
+use tt500_lcd_protocol::{Frame, HEIGHT, MIN_FRAME_INTERVAL, Rotation, WIDTH};
 
-use crate::{Fit, MAX_FPS, RenderError, RenderOptions, fit};
+use crate::{Fit, MAX_FPS, RenderError, RenderOptions, canvas_size, fit};
 
 /// How long to wait for the first decoded frame.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -25,6 +28,12 @@ const STDERR_TAIL: usize = 8;
 const STDERR_LINE_CHARS: usize = 200;
 /// Bytes in one raw RGB24 panel frame.
 const FRAME_BYTES: usize = WIDTH as usize * HEIGHT as usize * 3;
+/// Environment variable; `0` forces software decoding.
+pub const HWDEC_ENV: &str = "TT500_LCD_HWDEC";
+/// Longest loop (from the probe) whose encoded frames are kept for replay.
+const CACHE_MAX_DURATION: Duration = Duration::from_secs(60);
+/// Most encoded bytes kept for replay.
+const CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const FFMPEG: &str = "ffmpeg";
 const FFPROBE: &str = "ffprobe";
 
@@ -192,64 +201,90 @@ fn parse_probe(text: &str) -> Result<VideoInfo, RenderError> {
     })
 }
 
+/// The scale and the optional crop or pad that fit a `w`x`h` picture on the canvas.
+fn fit_steps(w: u32, h: u32, options: &RenderOptions) -> ((u32, u32), Option<String>) {
+    let target = canvas_size(options.rotation);
+    let (pw, ph) = target;
+    match options.fit {
+        Fit::Stretch => (target, None),
+        Fit::Cover => {
+            let (sw, sh) = fit::scaled_dims(w, h, true, target);
+            let post = format!("crop={pw}:{ph}:{}:{}", (sw - pw) / 2, (sh - ph) / 2);
+            ((sw, sh), Some(post))
+        }
+        Fit::Contain => {
+            let (sw, sh) = fit::scaled_dims(w, h, false, target);
+            let [r, g, b] = options.background;
+            let post = format!(
+                "pad={pw}:{ph}:{}:{}:color=0x{r:02x}{g:02x}{b:02x}",
+                (pw - sw) / 2,
+                (ph - sh) / 2
+            );
+            ((sw, sh), Some(post))
+        }
+    }
+}
+
 /// The ffmpeg `-vf` chain: rate cap, optional crop, fit, then raw RGB24.
-fn filter_graph(info: &VideoInfo, options: &RenderOptions) -> String {
-    let (pw, ph) = (u32::from(WIDTH), u32::from(HEIGHT));
+///
+/// Portrait steps decode at 128x480; `pump` turns each frame into the panel's 480x128. With
+/// `hardware` the frames are VA-API surfaces: without a crop `scale_vaapi` does the scaling on
+/// the GPU and only the small scaled picture is downloaded; with a crop the full picture is
+/// downloaded first, as the crop is exact only in software.
+fn filter_graph(info: &VideoInfo, options: &RenderOptions, hardware: bool) -> String {
     let mut parts = vec![format!(
         "fps={}",
         info.playback_fps(options.video_fps_cap())
     )];
     let (w, h) = match options.crop {
-        Some(c) => {
+        Some(c) => (c.width, c.height),
+        None => (info.width, info.height),
+    };
+    let ((sw, sh), post) = fit_steps(w, h, options);
+    if hardware && options.crop.is_none() {
+        parts.push(format!("scale_vaapi=w={sw}:h={sh}:format=nv12"));
+        // Crop and pad run on RGB, where their offsets and colour are exact.
+        parts.extend(["hwdownload", "format=nv12", "format=rgb24"].map(String::from));
+    } else {
+        if hardware {
+            parts.extend(["hwdownload", "format=nv12"].map(String::from));
+        }
+        if let Some(c) = options.crop {
             parts.push(format!(
                 "crop={}:{}:{}:{}:exact=1",
                 c.width, c.height, c.x, c.y
             ));
-            (c.width, c.height)
         }
-        None => (info.width, info.height),
-    };
-    match options.fit {
-        Fit::Stretch => parts.push(format!("scale={pw}:{ph}")),
-        Fit::Cover => {
-            let (sw, sh) = fit::scaled_dims(w, h, true);
-            parts.push(format!(
-                "scale={sw}:{sh},crop={pw}:{ph}:{}:{}",
-                (sw - pw) / 2,
-                (sh - ph) / 2
-            ));
-        }
-        Fit::Contain => {
-            let (sw, sh) = fit::scaled_dims(w, h, false);
-            let [r, g, b] = options.background;
-            parts.push(format!(
-                "scale={sw}:{sh},pad={pw}:{ph}:{}:{}:color=0x{r:02x}{g:02x}{b:02x}",
-                (pw - sw) / 2,
-                (ph - sh) / 2
-            ));
-        }
+        parts.push(format!("scale={sw}:{sh}"));
     }
+    parts.extend(post);
     parts.push("setsar=1".into());
     parts.push("format=rgb24".into());
     parts.join(",")
 }
 
-fn ffmpeg_args(path: &Path, info: &VideoInfo, options: &RenderOptions) -> Vec<OsString> {
-    let mut args: Vec<OsString> = [
-        "-hide_banner",
-        "-nostdin",
-        "-nostats",
-        "-loglevel",
-        "error",
-        "-stream_loop",
-        "-1",
-        "-i",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect();
+fn ffmpeg_args(
+    path: &Path,
+    info: &VideoInfo,
+    options: &RenderOptions,
+    vaapi: Option<&Path>,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["-hide_banner", "-nostdin", "-nostats", "-loglevel", "error"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    if let Some(device) = vaapi {
+        args.extend(
+            ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        args.push("-hwaccel_device".into());
+        args.push(device.into());
+    }
+    args.extend(["-stream_loop", "-1", "-i"].into_iter().map(OsString::from));
     args.push(file_url(path));
-    let filter = filter_graph(info, options);
+    let filter = filter_graph(info, options, vaapi.is_some());
     args.extend(
         [
             "-map",
@@ -269,6 +304,50 @@ fn ffmpeg_args(path: &Path, info: &VideoInfo, options: &RenderOptions) -> Vec<Os
         .map(OsString::from),
     );
     args
+}
+
+/// Whether the environment value (`TT500_LCD_HWDEC`) allows hardware decoding.
+fn hwdec_enabled(value: Option<&OsStr>) -> bool {
+    value.is_none_or(|v| {
+        !["0", "false", "off", "no"]
+            .iter()
+            .any(|off| v.eq_ignore_ascii_case(off))
+    })
+}
+
+/// The first DRM render node (`/dev/dri/renderD*`), if any.
+fn vaapi_device() -> Option<PathBuf> {
+    let mut nodes: Vec<PathBuf> = std::fs::read_dir("/dev/dri")
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
+        .map(|entry| entry.path())
+        .collect();
+    nodes.sort();
+    nodes.into_iter().next()
+}
+
+/// How a video is decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodePath {
+    /// VA-API hardware decoding and scaling.
+    Vaapi,
+    /// Software decoding, by choice or because there is no render node.
+    Software,
+    /// Software decoding after the VA-API attempt failed, with the reason.
+    SoftwareFallback(String),
+}
+
+impl fmt::Display for DecodePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vaapi => f.write_str("VA-API hardware decoding"),
+            Self::Software => f.write_str("software decoding"),
+            Self::SoftwareFallback(reason) => {
+                write!(f, "software decoding (VA-API failed: {reason})")
+            }
+        }
+    }
 }
 
 /// Kills and reaps ffmpeg when dropped, so neither the process nor a zombie outlives the stream.
@@ -306,10 +385,75 @@ pub enum VideoPoll {
 /// A running decoder producing panel-ready frames; dropping it kills and reaps ffmpeg.
 #[derive(Debug)]
 pub struct VideoStream {
-    frames: Receiver<Result<Frame, String>>,
     first: Frame,
     interval: Duration,
-    process: Process,
+    decode: DecodePath,
+    state: Box<RefCell<State>>,
+}
+
+/// Where polled frames come from.
+#[derive(Debug)]
+enum State {
+    /// ffmpeg is running; `cache` collects the first loop while it still fits.
+    Live {
+        frames: Receiver<Result<Frame, String>>,
+        process: Process,
+        cache: Option<LoopCache>,
+    },
+    /// The first loop is cached and ffmpeg is gone; `next` indexes the frame to play next.
+    Replay { frames: Vec<Frame>, next: usize },
+}
+
+/// The encoded frames of the first loop, starting with the first frame.
+#[derive(Debug)]
+struct LoopCache {
+    /// Frames in one loop.
+    target: usize,
+    max_bytes: usize,
+    bytes: usize,
+    frames: Vec<Frame>,
+}
+
+impl LoopCache {
+    /// A cache seeded with `first`, or `None` when it alone exceeds `max_bytes`.
+    fn new(target: usize, max_bytes: usize, first: &Frame) -> Option<Self> {
+        let bytes = first.as_bytes().len();
+        (target > 0 && bytes <= max_bytes).then(|| Self {
+            target,
+            max_bytes,
+            bytes,
+            frames: vec![first.clone()],
+        })
+    }
+
+    /// Adds `frame`; `false` when the loop no longer fits and the cache must be dropped.
+    fn push(&mut self, frame: &Frame) -> bool {
+        self.bytes += frame.as_bytes().len();
+        self.frames.push(frame.clone());
+        self.bytes <= self.max_bytes
+    }
+
+    fn is_full(&self) -> bool {
+        self.frames.len() >= self.target
+    }
+}
+
+/// How many frames of the first loop to keep, from the probe.
+#[derive(Debug, Clone, Copy)]
+struct CachePlan {
+    frames: usize,
+    max_bytes: usize,
+}
+
+impl CachePlan {
+    fn for_video(info: &VideoInfo, max_fps: u32) -> Option<Self> {
+        info.duration.filter(|d| *d <= CACHE_MAX_DURATION)?;
+        let frames = usize::try_from(info.frames_per_loop(max_fps)?).ok()?;
+        (frames > 0).then_some(Self {
+            frames,
+            max_bytes: CACHE_MAX_BYTES,
+        })
+    }
 }
 
 const _: () = {
@@ -319,6 +463,11 @@ const _: () = {
 
 impl VideoStream {
     /// Starts ffmpeg on `path` and waits for the first frame.
+    ///
+    /// Tries VA-API first (unless `TT500_LCD_HWDEC=0` or there is no render node) and falls back
+    /// to software decoding for this file if that fails to produce a frame. A video of at most
+    /// 60 s whose encoded loop fits 64 MiB is cached during its first loop and then replayed
+    /// without ffmpeg.
     ///
     /// # Errors
     /// [`RenderError::BadCrop`] (checked before spawning), [`RenderError::MissingFfmpeg`], or
@@ -331,8 +480,30 @@ impl VideoStream {
         if let Some(crop) = options.crop {
             crop.check(info.width, info.height)?;
         }
+        let mut decode = DecodePath::Software;
+        if hwdec_enabled(std::env::var_os(HWDEC_ENV).as_deref())
+            && let Some(device) = vaapi_device()
+        {
+            match Self::spawn_ffmpeg(path, info, options, Some(&device), DecodePath::Vaapi) {
+                Ok(stream) => return Ok(stream),
+                Err(err @ RenderError::MissingFfmpeg) => return Err(err),
+                Err(err) => decode = DecodePath::SoftwareFallback(err.to_string()),
+            }
+        }
+        Self::spawn_ffmpeg(path, info, options, None, decode)
+    }
+
+    fn spawn_ffmpeg(
+        path: &Path,
+        info: &VideoInfo,
+        options: &RenderOptions,
+        vaapi: Option<&Path>,
+        decode: DecodePath,
+    ) -> Result<Self, RenderError> {
+        // Never inherit a stdin; ffmpeg gets killed when the stream drops. If this process is
+        // killed instead, ffmpeg dies of SIGPIPE at its next write to the closed pipe.
         let mut child = Command::new(FFMPEG)
-            .args(ffmpeg_args(path, info, options))
+            .args(ffmpeg_args(path, info, options, vaapi))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -349,11 +520,14 @@ impl VideoStream {
             stdout,
             info.frame_interval(options.video_fps_cap()),
             options.quality,
+            options.rotation,
             process,
+            CachePlan::for_video(info, options.video_fps_cap()),
+            decode,
         )
     }
 
-    /// Plays raw 480x128 RGB24 frames from `reader` (the decoder seam; tests use a `Cursor`).
+    /// Plays raw 480x128 RGB24 frames (rotation step 0) from `reader` (the decoder seam; tests use a `Cursor`).
     ///
     /// `frame_interval` is raised to `MIN_FRAME_INTERVAL`. Waits for the first frame.
     ///
@@ -368,7 +542,10 @@ impl VideoStream {
             reader,
             frame_interval.max(MIN_FRAME_INTERVAL),
             quality,
+            Rotation::default(),
             Process::default(),
+            None,
+            DecodePath::Software,
         )
     }
 
@@ -376,20 +553,30 @@ impl VideoStream {
         reader: impl Read + Send + 'static,
         interval: Duration,
         quality: u8,
+        rotation: Rotation,
         process: Process,
+        plan: Option<CachePlan>,
+        decode: DecodePath,
     ) -> Result<Self, RenderError> {
         let (sender, frames) = mpsc::sync_channel(QUEUE_DEPTH);
         thread::Builder::new()
             .name("video-decode".into())
-            .spawn(move || pump(reader, &sender, quality))
+            .spawn(move || pump(reader, &sender, quality, rotation))
             .map_err(|err| thread_error(&err))?;
         match frames.recv_timeout(FIRST_FRAME_TIMEOUT) {
-            Ok(Ok(first)) => Ok(Self {
-                frames,
-                first,
-                interval,
-                process,
-            }),
+            Ok(Ok(first)) => {
+                let cache = plan.and_then(|p| LoopCache::new(p.frames, p.max_bytes, &first));
+                Ok(Self {
+                    first,
+                    interval,
+                    decode,
+                    state: Box::new(RefCell::new(State::Live {
+                        frames,
+                        process,
+                        cache,
+                    })),
+                })
+            }
             other => {
                 let reason = match other {
                     Ok(Err(reason)) => reason,
@@ -428,20 +615,55 @@ impl VideoStream {
 
     /// Returns the next frame if it is ready; never blocks.
     pub fn poll(&self) -> VideoPoll {
-        match self.frames.try_recv() {
-            Ok(Ok(frame)) => VideoPoll::Frame(frame),
-            Ok(Err(reason)) => VideoPoll::Ended(with_tail(&reason, &self.process.tail)),
-            Err(TryRecvError::Empty) => VideoPoll::Pending,
-            Err(TryRecvError::Disconnected) => {
-                VideoPoll::Ended(with_tail("the decoder stopped", &self.process.tail))
+        let mut state = self.state.borrow_mut();
+        match &mut *state {
+            State::Replay { frames, next } => {
+                let frame = frames[*next].clone();
+                *next = (*next + 1) % frames.len();
+                VideoPoll::Frame(frame)
             }
+            State::Live {
+                frames,
+                process,
+                cache,
+            } => match frames.try_recv() {
+                Ok(Ok(frame)) => {
+                    if let Some(kept) = cache
+                        && !kept.push(&frame)
+                    {
+                        *cache = None;
+                    }
+                    if let Some(kept) = cache
+                        && kept.is_full()
+                    {
+                        // The first loop is complete: dropping the state stops ffmpeg.
+                        let frames = mem::take(&mut kept.frames);
+                        *state = State::Replay { frames, next: 0 };
+                    }
+                    VideoPoll::Frame(frame)
+                }
+                Ok(Err(reason)) => VideoPoll::Ended(with_tail(&reason, &process.tail)),
+                Err(TryRecvError::Empty) => VideoPoll::Pending,
+                Err(TryRecvError::Disconnected) => {
+                    VideoPoll::Ended(with_tail("the decoder stopped", &process.tail))
+                }
+            },
         }
     }
 
-    /// ffmpeg's pid, `None` for [`VideoStream::from_raw_rgb`] (logging, tests).
+    /// ffmpeg's pid, `None` for [`VideoStream::from_raw_rgb`] and once a cached loop replays.
     #[must_use]
     pub fn process_id(&self) -> Option<u32> {
-        self.process.child.0.as_ref().map(Child::id)
+        match &*self.state.borrow() {
+            State::Live { process, .. } => process.child.0.as_ref().map(Child::id),
+            State::Replay { .. } => None,
+        }
+    }
+
+    /// How this stream is decoded (for logging).
+    #[must_use]
+    pub fn decode_path(&self) -> &DecodePath {
+        &self.decode
     }
 }
 
@@ -480,7 +702,13 @@ fn with_tail(reason: &str, tail: &Mutex<VecDeque<String>>) -> String {
 }
 
 /// Reads raw frames, encodes them and queues them; blocks when the queue is full (backpressure).
-fn pump(mut reader: impl Read, frames: &SyncSender<Result<Frame, String>>, quality: u8) {
+fn pump(
+    mut reader: impl Read,
+    frames: &SyncSender<Result<Frame, String>>,
+    quality: u8,
+    rotation: Rotation,
+) {
+    let (width, height) = canvas_size(rotation);
     let mut previous: Option<Frame> = None;
     loop {
         let mut raw = vec![0u8; FRAME_BYTES];
@@ -493,9 +721,8 @@ fn pump(mut reader: impl Read, frames: &SyncSender<Result<Frame, String>>, quali
             let _ = frames.send(Err(reason));
             return;
         }
-        let rgb = RgbImage::from_raw(u32::from(WIDTH), u32::from(HEIGHT), raw)
-            .expect("buffer holds exactly one frame");
-        let frame = match crate::render_panel_rgb(rgb, quality) {
+        let rgb = RgbImage::from_raw(width, height, raw).expect("buffer holds exactly one frame");
+        let frame = match crate::render_canvas_rgb(rgb, rotation, quality) {
             Ok(frame) => frame,
             // Too detailed even at the lowest quality: repeat the previous frame to keep pacing.
             Err(RenderError::TooComplex) => match &previous {
@@ -518,6 +745,7 @@ fn pump(mut reader: impl Read, frames: &SyncSender<Result<Frame, String>>, quali
 mod tests {
     use std::io::Cursor;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Instant;
 
@@ -584,7 +812,7 @@ mod tests {
     fn filter_graphs() {
         let info = info(Some(30.0));
         assert_eq!(
-            filter_graph(&info, &RenderOptions::default()),
+            filter_graph(&info, &RenderOptions::default(), false),
             "fps=15,scale=480:270,crop=480:128:0:71,setsar=1,format=rgb24"
         );
         let contain = RenderOptions {
@@ -599,15 +827,23 @@ mod tests {
             ..RenderOptions::default()
         };
         assert_eq!(
-            filter_graph(&info, &contain),
+            filter_graph(&info, &contain, false),
             "fps=15,crop=400:400:100:50:exact=1,scale=128:128,pad=480:128:176:0:color=0x010203,setsar=1,format=rgb24"
+        );
+        let portrait = RenderOptions {
+            rotation: Rotation::try_from(1).unwrap(),
+            ..RenderOptions::default()
+        };
+        assert_eq!(
+            filter_graph(&info, &portrait, false),
+            "fps=15,scale=854:480,crop=128:480:363:0,setsar=1,format=rgb24"
         );
         let stretch = RenderOptions {
             fit: Fit::Stretch,
             ..RenderOptions::default()
         };
         assert_eq!(
-            filter_graph(&info, &stretch),
+            filter_graph(&info, &stretch, false),
             "fps=15,scale=480:128,setsar=1,format=rgb24"
         );
     }
@@ -618,11 +854,193 @@ mod tests {
             Path::new("/v/a b.mp4"),
             &info(Some(30.0)),
             &RenderOptions::default(),
+            None,
         );
         let args: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
         assert!(args.windows(2).any(|w| w == ["-stream_loop", "-1"]));
         assert!(args.contains(&"file:/v/a b.mp4"));
+        assert!(!args.contains(&"-hwaccel"));
         assert_eq!(args.last(), Some(&"pipe:1"));
+    }
+
+    #[test]
+    fn hardware_graphs_scale_on_the_gpu_and_match_the_fit() {
+        let info = info(Some(30.0));
+        assert_eq!(
+            filter_graph(&info, &RenderOptions::default(), true),
+            "fps=15,scale_vaapi=w=480:h=270:format=nv12,hwdownload,format=nv12,format=rgb24,crop=480:128:0:71,setsar=1,format=rgb24"
+        );
+        let stretch = RenderOptions {
+            fit: Fit::Stretch,
+            ..RenderOptions::default()
+        };
+        assert_eq!(
+            filter_graph(&info, &stretch, true),
+            "fps=15,scale_vaapi=w=480:h=128:format=nv12,hwdownload,format=nv12,format=rgb24,setsar=1,format=rgb24"
+        );
+        let portrait = RenderOptions {
+            rotation: Rotation::try_from(1).unwrap(),
+            ..RenderOptions::default()
+        };
+        assert_eq!(
+            filter_graph(&info, &portrait, true),
+            "fps=15,scale_vaapi=w=854:h=480:format=nv12,hwdownload,format=nv12,format=rgb24,crop=128:480:363:0,setsar=1,format=rgb24"
+        );
+        // A crop is exact only in software: download first, then the software chain.
+        let contain = RenderOptions {
+            fit: Fit::Contain,
+            background: [1, 2, 3],
+            crop: Some(Crop {
+                x: 100,
+                y: 50,
+                width: 400,
+                height: 400,
+            }),
+            ..RenderOptions::default()
+        };
+        assert_eq!(
+            filter_graph(&info, &contain, true),
+            "fps=15,hwdownload,format=nv12,crop=400:400:100:50:exact=1,scale=128:128,pad=480:128:176:0:color=0x010203,setsar=1,format=rgb24"
+        );
+    }
+
+    #[test]
+    fn hardware_args_select_vaapi_before_the_input() {
+        let args = ffmpeg_args(
+            Path::new("/v/a.mp4"),
+            &info(Some(30.0)),
+            &RenderOptions::default(),
+            Some(Path::new("/dev/dri/renderD128")),
+        );
+        let args: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
+        let input = args.iter().position(|a| *a == "-i").unwrap();
+        let hw = args.iter().position(|a| *a == "-hwaccel").unwrap();
+        assert!(hw < input);
+        assert_eq!(
+            &args[hw..hw + 6],
+            [
+                "-hwaccel",
+                "vaapi",
+                "-hwaccel_output_format",
+                "vaapi",
+                "-hwaccel_device",
+                "/dev/dri/renderD128"
+            ]
+        );
+        assert!(args.iter().any(|a| a.contains("scale_vaapi")));
+    }
+
+    #[test]
+    fn hwdec_env_can_force_software() {
+        assert!(hwdec_enabled(None));
+        assert!(hwdec_enabled(Some(OsStr::new("1"))));
+        assert!(hwdec_enabled(Some(OsStr::new("auto"))));
+        assert!(!hwdec_enabled(Some(OsStr::new("0"))));
+        assert!(!hwdec_enabled(Some(OsStr::new("off"))));
+    }
+
+    /// An endless source of distinct grey frames that records when it is dropped.
+    struct Endless {
+        n: u8,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            buf.fill(self.n.wrapping_mul(37));
+            self.n = self.n.wrapping_add(1);
+            Ok(buf.len())
+        }
+    }
+
+    impl Drop for Endless {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn endless_stream(plan: CachePlan) -> (VideoStream, Arc<AtomicBool>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let reader = Endless {
+            n: 0,
+            dropped: Arc::clone(&dropped),
+        };
+        let stream = VideoStream::start(
+            reader,
+            Duration::from_millis(70),
+            90,
+            Rotation::default(),
+            Process::default(),
+            Some(plan),
+            DecodePath::Software,
+        )
+        .unwrap();
+        (stream, dropped)
+    }
+
+    fn next_frame(stream: &VideoStream) -> Frame {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match stream.poll() {
+                VideoPoll::Frame(frame) => return frame,
+                VideoPoll::Pending => {
+                    assert!(Instant::now() < deadline, "no frame in 5 s");
+                    thread::sleep(Duration::from_millis(2));
+                }
+                VideoPoll::Ended(reason) => panic!("ended: {reason}"),
+            }
+        }
+    }
+
+    #[test]
+    fn first_loop_is_cached_then_replayed_without_the_decoder() {
+        const LOOP: usize = 4;
+        let (stream, dropped) = endless_stream(CachePlan {
+            frames: LOOP,
+            max_bytes: 1 << 20,
+        });
+        let interval = stream.frame_interval();
+        let mut pass = vec![stream.first_frame().clone()];
+        pass.extend((1..LOOP).map(|_| next_frame(&stream)));
+        // The loop is complete: the decoder (and its reader) is dropped.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "decoder was not dropped");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(stream.process_id(), None);
+        for round in 0..3 {
+            for (i, expected) in pass.iter().enumerate() {
+                assert_eq!(next_frame(&stream), *expected, "round {round} frame {i}");
+            }
+        }
+        // Replay keeps the first pass's pacing.
+        assert_eq!(stream.frame_interval(), interval);
+    }
+
+    #[test]
+    fn oversize_loops_are_not_cached() {
+        let (stream, dropped) = endless_stream(CachePlan {
+            frames: 4,
+            max_bytes: 64,
+        });
+        let frames: Vec<Frame> = (0..8).map(|_| next_frame(&stream)).collect();
+        assert!(frames.windows(2).all(|w| w[0] != w[1]), "keeps decoding");
+        assert!(!dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cache_plan_needs_a_short_known_loop() {
+        let mut clip = VideoInfo {
+            duration: Some(Duration::from_secs(10)),
+            ..info(Some(30.0))
+        };
+        let plan = CachePlan::for_video(&clip, 15).unwrap();
+        assert_eq!((plan.frames, plan.max_bytes), (150, 64 * 1024 * 1024));
+        clip.duration = Some(Duration::from_secs(61));
+        assert!(CachePlan::for_video(&clip, 15).is_none());
+        clip.duration = None;
+        assert!(CachePlan::for_video(&clip, 15).is_none());
     }
 
     #[test]

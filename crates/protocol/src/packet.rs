@@ -107,6 +107,45 @@ pub(crate) const fn brightness_command(brightness: Brightness) -> FeatureCommand
     FeatureCommand::from_prefix(&[0x03, 0x0c, brightness.0])
 }
 
+/// Panel rotation step as sent by TT RGB Plus (`03 1d NN`), 0 to 3.
+///
+/// The panel ignores the command visually: TT RGB Plus rotates the picture itself and the
+/// frame stays 480x128 whatever the step. 0 is normal, 2 is turned 180 degrees, 1 and 3 are
+/// portrait layouts (128x480) turned 90 degrees clockwise and counter-clockwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Rotation(u8);
+
+impl Rotation {
+    /// The step number.
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for Rotation {
+    type Error = RotationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value <= 3 {
+            Ok(Self(value))
+        } else {
+            Err(RotationError { value })
+        }
+    }
+}
+
+/// A rotation step above 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("rotation {value} is out of range 0..=3")]
+pub struct RotationError {
+    value: u8,
+}
+
+/// `03 1d NN` + zeros: rotation step, as sent by TT RGB Plus's rotate buttons.
+pub(crate) const fn rotation_command(rotation: Rotation) -> FeatureCommand {
+    FeatureCommand::from_prefix(&[0x03, 0x1d, rotation.0])
+}
+
 /// The feature reports the panel is ever asked for (GET_FEATURE).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FeatureQuery {
@@ -368,6 +407,24 @@ mod tests {
     fn brightness_command_is_03_0c_nn_and_zeros() {
         let command = brightness_command(Brightness::try_from(40).unwrap());
         assert_eq!(command.as_bytes(), &literal(&[0x03, 0x0c, 0x28]));
+    }
+
+    #[test]
+    fn rotation_range() {
+        for step in 0..=3 {
+            assert_eq!(Rotation::try_from(step).unwrap().get(), step);
+        }
+        assert!(Rotation::try_from(4).is_err());
+        assert!(Rotation::try_from(255).is_err());
+        assert_eq!(Rotation::default().get(), 0);
+    }
+
+    #[test]
+    fn rotation_command_is_03_1d_nn_and_zeros() {
+        for step in 0..=3 {
+            let command = rotation_command(Rotation::try_from(step).unwrap());
+            assert_eq!(command.as_bytes(), &literal(&[0x03, 0x1d, step]));
+        }
     }
 
     #[test]

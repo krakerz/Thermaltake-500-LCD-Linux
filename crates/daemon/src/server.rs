@@ -13,17 +13,18 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tt500_lcd_ipc::{
     ContentInfo, ContentKind, DEFAULT_FPS, DryRunReply, ErrorCode, Event, EventEnvelope,
-    FramingError, IpcError, LiveSource, MAX_FPS, Outcome, PreviewReply, Request, RequestEnvelope,
-    Response, ShowLiveParams, Size, Status, UploadBootAnimationParams, UploadStandbyParams,
-    read_message, write_message,
+    FramingError, IpcError, LiveSource, MAX_FPS, Outcome, PreviewReply, ProfileSource, ProfileSpec,
+    Request, RequestEnvelope, Response, ShowLiveParams, ShowParams, Size, Status,
+    UploadBootAnimationParams, UploadStandbyParams, read_message, write_message,
 };
-use tt500_lcd_protocol::Brightness;
+use tt500_lcd_protocol::{Brightness, Rotation};
 
 use crate::boot::write_boot_dry_run;
 use crate::hub::StatusHub;
 use crate::live::{self, LiveControl};
+use crate::profiles::ProfileHub;
 use crate::standby::write_dry_run;
-use crate::store::{self, ContentStore};
+use crate::store::{self, ContentStore, Restored};
 use crate::streamer::{Command, Content};
 
 /// How long a request waits for the streamer to answer.
@@ -35,7 +36,7 @@ const PEER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// Read timeout of that check.
 const PEER_PROBE_TIMEOUT: Duration = Duration::from_millis(10);
 /// Widest preview image; the crop editor shows it at most this large.
-const PREVIEW_MAX_WIDTH: u32 = 960;
+const PREVIEW_MAX_WIDTH: u32 = 1920;
 /// File name of the preview inside the live run directory.
 const PREVIEW_FILE: &str = "preview.jpg";
 
@@ -48,6 +49,8 @@ pub struct ServerContext {
     pub live: Mutex<Option<LiveControl>>,
     /// Where live sources keep their files (virtual desktop, preview).
     pub run_dir: PathBuf,
+    /// Saved profiles and which one is active.
+    pub profiles: ProfileHub,
 }
 
 /// Creates the socket (dir 0700, socket 0600), replacing a stale one.
@@ -179,14 +182,145 @@ fn stream_events(
     }
 }
 
+/// Forgets the stored content, stops a live source and blanks the panel.
+fn clear_content(ctx: &ServerContext) -> Result<Status, IpcError> {
+    ctx.store.clear();
+    *ctx.live.lock().expect("lock poisoned") = None;
+    ask(ctx, |reply| Command::Clear { reply })
+}
+
 fn dispatch(ctx: &ServerContext, request: Request) -> Result<Outcome, IpcError> {
     let status = match request {
         Request::Status => Ok(ctx.status.get()),
         Request::Show(params) => {
-            check_fps(params.fps)?;
-            let (content, info) =
-                ctx.store
-                    .replace(&params.path, params.fit, params.crop, params.fps)?;
+            show_file(ctx, &params).inspect(|_| ctx.profiles.note_direct_change())
+        }
+        Request::Clear => clear_content(ctx).inspect(|_| ctx.profiles.note_direct_change()),
+        Request::SetBrightness(params) => set_brightness_value(ctx, params.value),
+        Request::UploadStandby(params) => return upload_standby(ctx, &params),
+        Request::UploadBootAnimation(params) => return upload_boot_animation(ctx, &params),
+        Request::ShowLive(params) => {
+            show_live(ctx, params).inspect(|_| ctx.profiles.note_direct_change())
+        }
+        Request::Preview => return preview(ctx),
+        Request::SetRotation(params) => {
+            let (status, changed) = set_rotation_raw(ctx, params.value)?;
+            if changed {
+                rerender(ctx, status)
+            } else {
+                Ok(status)
+            }
+        }
+        request @ (Request::ProfileList
+        | Request::ProfileSave(_)
+        | Request::ProfileRename(_)
+        | Request::ProfileDelete(_)
+        | Request::ProfileActivate(_)
+        | Request::ProfileSetTriggers(_)
+        | Request::ProfileReorder(_)
+        | Request::ProfileReset(_)) => return crate::profiles::handlers::handle(ctx, request),
+        _ => Err(IpcError {
+            code: ErrorCode::Unsupported,
+            message: "unsupported request".to_owned(),
+        }),
+    };
+    status.map(Outcome::Result)
+}
+
+/// Renders and shows a file, replacing the content (any live source stops).
+fn show_file(ctx: &ServerContext, params: &ShowParams) -> Result<Status, IpcError> {
+    check_fps(params.fps)?;
+    let (content, info) = ctx
+        .store
+        .replace(&params.path, params.fit, params.crop, params.fps)?;
+    *ctx.live.lock().expect("lock poisoned") = None;
+    ask(ctx, |reply| Command::Show {
+        content,
+        info,
+        reply,
+    })
+}
+
+/// Stores and applies a brightness percentage.
+fn set_brightness_value(ctx: &ServerContext, value: u8) -> Result<Status, IpcError> {
+    let value = Brightness::try_from(value).map_err(|err| IpcError {
+        code: ErrorCode::BadRequest,
+        message: err.to_string(),
+    })?;
+    ctx.store.set_brightness(value)?;
+    ask(ctx, |reply| Command::SetBrightness { value, reply })
+}
+
+/// Stores and applies a rotation without re-rendering; the flag tells whether it changed.
+fn set_rotation_raw(ctx: &ServerContext, value: u8) -> Result<(Status, bool), IpcError> {
+    let value = Rotation::try_from(value).map_err(|err| IpcError {
+        code: ErrorCode::BadRequest,
+        message: err.to_string(),
+    })?;
+    let changed = ctx.store.rotation() != value;
+    ctx.store.set_rotation(value)?;
+    let status = ask(ctx, |reply| Command::SetRotation { value, reply })?;
+    Ok((status, changed))
+}
+
+/// Applies a profile: rotation, then the source, then brightness. When showing the source
+/// fails the rotation is rolled back and the content is left as it was.
+///
+/// # Errors
+/// The error of whichever step failed.
+pub fn apply_profile(ctx: &ServerContext, spec: &ProfileSpec) -> Result<Status, IpcError> {
+    let before = ctx.store.rotation().get();
+    let mut changed = false;
+    if let Some(rotation) = spec.rotation
+        && rotation != before
+    {
+        changed = set_rotation_raw(ctx, rotation)?.1;
+    }
+    let shown = match &spec.source {
+        Some(ProfileSource::Static { path }) => show_file(
+            ctx,
+            &ShowParams {
+                path: path.clone(),
+                fit: spec.fit,
+                crop: spec.crop,
+                fps: spec.fps,
+            },
+        ),
+        Some(ProfileSource::Live { source }) => show_live(
+            ctx,
+            ShowLiveParams {
+                source: source.clone(),
+                fit: spec.fit,
+                crop: spec.crop,
+                fps: spec.fps,
+                steady: spec.steady,
+            },
+        ),
+        Some(ProfileSource::Clear) => clear_content(ctx),
+        None if changed => rerender(ctx, ctx.status.get()),
+        None => Ok(ctx.status.get()),
+    };
+    let mut status = match shown {
+        Ok(status) => status,
+        Err(err) => {
+            if changed && let Err(rollback) = set_rotation_raw(ctx, before) {
+                tracing::warn!("cannot roll the rotation back: {rollback}");
+            }
+            return Err(err);
+        }
+    };
+    if let Some(brightness) = spec.brightness {
+        status = set_brightness_value(ctx, brightness)?;
+    }
+    Ok(status)
+}
+
+/// Shows the stored content again so it is rendered for the new rotation: live sources only
+/// get new options (capture keeps running), videos restart, images are re-rendered.
+fn rerender(ctx: &ServerContext, status: Status) -> Result<Status, IpcError> {
+    match ctx.store.restore() {
+        Restored::Nothing => Ok(status),
+        Restored::Loaded(content, info) => {
             *ctx.live.lock().expect("lock poisoned") = None;
             ask(ctx, |reply| Command::Show {
                 content,
@@ -194,29 +328,12 @@ fn dispatch(ctx: &ServerContext, request: Request) -> Result<Outcome, IpcError> 
                 reply,
             })
         }
-        Request::Clear => {
-            ctx.store.clear();
-            *ctx.live.lock().expect("lock poisoned") = None;
-            ask(ctx, |reply| Command::Clear { reply })
+        Restored::Live(params) => show_live(ctx, params),
+        Restored::Failed(message) => {
+            tracing::warn!("cannot re-render for the new rotation: {message}");
+            Ok(status)
         }
-        Request::SetBrightness(params) => {
-            let value = Brightness::try_from(params.value).map_err(|err| IpcError {
-                code: ErrorCode::BadRequest,
-                message: err.to_string(),
-            })?;
-            ctx.store.set_brightness(value)?;
-            ask(ctx, |reply| Command::SetBrightness { value, reply })
-        }
-        Request::UploadStandby(params) => return upload_standby(ctx, &params),
-        Request::UploadBootAnimation(params) => return upload_boot_animation(ctx, &params),
-        Request::ShowLive(params) => show_live(ctx, params),
-        Request::Preview => return preview(ctx),
-        _ => Err(IpcError {
-            code: ErrorCode::Unsupported,
-            message: "unsupported request".to_owned(),
-        }),
-    };
-    status.map(Outcome::Result)
+    }
 }
 
 fn check_fps(fps: Option<u32>) -> Result<(), IpcError> {
@@ -242,7 +359,7 @@ fn live_info(params: &ShowLiveParams, fps: u32, steady: bool, size: Option<Size>
         duration_ms: None,
         path: None,
         max_fps: params.fps,
-        live: Some(params.source.clone()),
+        live: Some(live::persistent(&params.source)),
         steady: Some(steady),
     }
 }
@@ -251,7 +368,7 @@ fn live_info(params: &ShowLiveParams, fps: u32, steady: bool, size: Option<Size>
 ///
 /// # Errors
 /// `BadRequest` for a bad fps or desktop spec, `Unavailable` when the source can't be reached
-/// and `Unsupported` for the portal.
+/// (or the portal's GStreamer is missing).
 pub fn show_live(ctx: &ServerContext, params: ShowLiveParams) -> Result<Status, IpcError> {
     check_fps(params.fps)?;
     if let LiveSource::Desktop(spec) = &params.source {
@@ -264,11 +381,14 @@ pub fn show_live(ctx: &ServerContext, params: ShowLiveParams) -> Result<Status, 
     let steady = params
         .steady
         .unwrap_or_else(|| live::default_steady(&params.source));
-    let options = store::render_options(params.fit, params.crop, params.fps);
+    let options = store::render_options(params.fit, params.crop, params.fps, ctx.store.rotation());
+    let source = live::persistent(&params.source);
+    let reselect = matches!(params.source, LiveSource::Portal { reselect: true });
     let mut slot = ctx.live.lock().expect("lock poisoned");
     if let Some(control) = slot.as_ref()
-        && control.spec() == &params.source
+        && control.spec() == &source
         && control.is_alive()
+        && !reselect
     {
         control.set_options(options, fps, steady);
         let size = control.latest().map(|(img, _)| Size {
@@ -276,25 +396,21 @@ pub fn show_live(ctx: &ServerContext, params: ShowLiveParams) -> Result<Status, 
             height: img.height(),
         });
         let info = live_info(&params, fps, steady, size);
-        ctx.store.replace_live(
-            &params.source,
-            params.fit,
-            params.crop,
-            params.fps,
-            params.steady,
-        )?;
+        ctx.store
+            .replace_live(&source, params.fit, params.crop, params.fps, params.steady)?;
         return ask(ctx, |reply| Command::UpdateInfo { info, reply });
     }
-    let (stream, control, size) =
-        live::start(params.source.clone(), options, fps, steady, &ctx.run_dir)?;
-    let info = live_info(&params, fps, steady, Some(size));
-    ctx.store.replace_live(
-        &params.source,
-        params.fit,
-        params.crop,
-        params.fps,
-        params.steady,
+    let (stream, control, size) = live::start(
+        params.source.clone(),
+        options,
+        fps,
+        steady,
+        &ctx.run_dir,
+        ctx.store.state_dir(),
     )?;
+    let info = live_info(&params, fps, steady, Some(size));
+    ctx.store
+        .replace_live(&source, params.fit, params.crop, params.fps, params.steady)?;
     *slot = Some(control);
     ask(ctx, |reply| Command::Show {
         content: Content::Live(stream),
@@ -315,28 +431,33 @@ fn preview(ctx: &ServerContext) -> Result<Outcome, IpcError> {
         }
         Err(TryLockError::Poisoned(_)) => panic!("lock poisoned"),
     };
-    let Some((img, seq)) = control.and_then(|control| control.latest()) else {
+    let Some(control) = control else {
         return Err(IpcError {
             code: ErrorCode::NotFound,
             message: "no live source is running".to_owned(),
         });
     };
-    let jpeg = tt500_lcd_render::encode_preview_jpeg(&img, PREVIEW_MAX_WIDTH)
+    let preview = control
+        .preview(PREVIEW_MAX_WIDTH)
         .map_err(|err| store::render_error(&err))?;
+    let Some(preview) = preview else {
+        return Err(IpcError {
+            code: ErrorCode::NotFound,
+            message: "no live source is running".to_owned(),
+        });
+    };
     let internal = |what: &str, err: io::Error| IpcError {
         code: ErrorCode::Internal,
         message: format!("{what}: {err}"),
     };
     fs::create_dir_all(&ctx.run_dir).map_err(|err| internal("cannot create the live dir", err))?;
     let path = ctx.run_dir.join(PREVIEW_FILE);
-    store::write_atomic(&path, &jpeg).map_err(|err| internal("cannot write the preview", err))?;
+    store::write_atomic(&path, &preview.jpeg)
+        .map_err(|err| internal("cannot write the preview", err))?;
     Ok(Outcome::Preview(PreviewReply {
         path,
-        size: Size {
-            width: img.width(),
-            height: img.height(),
-        },
-        seq,
+        size: preview.size,
+        seq: preview.seq,
     }))
 }
 
@@ -347,10 +468,13 @@ fn upload_standby(ctx: &ServerContext, params: &UploadStandbyParams) -> Result<O
         .store
         .render_standby(&params.path, params.fit, params.crop)?;
     if params.dry_run {
-        let files = write_dry_run(ctx.store.state_dir(), &image).map_err(|err| IpcError {
-            code: ErrorCode::Internal,
-            message: format!("cannot write the dry-run files: {err}"),
-        })?;
+        let files =
+            write_dry_run(ctx.store.state_dir(), &image, ctx.store.rotation()).map_err(|err| {
+                IpcError {
+                    code: ErrorCode::Internal,
+                    message: format!("cannot write the dry-run files: {err}"),
+                }
+            })?;
         tracing::info!(
             "standby dry run: {} bytes JPEG, packets in {}; nothing sent",
             image.byte_len(),
@@ -382,8 +506,8 @@ fn upload_boot_animation(
         );
     }
     if params.dry_run {
-        let files =
-            write_boot_dry_run(ctx.store.state_dir(), &rendered).map_err(|err| IpcError {
+        let files = write_boot_dry_run(ctx.store.state_dir(), &rendered, ctx.store.rotation())
+            .map_err(|err| IpcError {
                 code: ErrorCode::Internal,
                 message: format!("cannot write the dry-run files: {err}"),
             })?;
@@ -470,12 +594,19 @@ mod tests {
             device: DeviceState::Idle,
             content: None,
             brightness: 100,
+            rotation: None,
             content_error: None,
+            profile: None,
         }));
         let (commands, receiver) = mpsc::channel();
         let ctx = ServerContext {
             store,
             commands,
+            profiles: ProfileHub::load(
+                &tmp.join("state"),
+                Arc::clone(&status),
+                ProfileSpec::default,
+            ),
             status,
             live: Mutex::new(None),
             run_dir: tmp.join("live"),
@@ -512,7 +643,9 @@ mod tests {
                     device: DeviceState::Idle,
                     content: Some(info.clone()),
                     brightness: 100,
+                    rotation: None,
                     content_error: None,
+                    profile: None,
                 })
                 .unwrap();
             info

@@ -130,6 +130,21 @@ pub fn install_service(
     systemctl_ok(runner, &["enable", "--now", UNIT_NAME])
 }
 
+/// Restarts the unit when it is installed and running, so it picks up replaced binaries.
+/// Returns whether a restart was done.
+///
+/// # Errors
+///
+/// Fails when `systemctl` cannot be started or the restart fails.
+pub fn restart_service(runner: &dyn Runner, config_home: &Path) -> Result<bool, SetupError> {
+    let state = service_status(runner, config_home)?;
+    if !(state.unit_installed && state.active) {
+        return Ok(false);
+    }
+    systemctl_ok(runner, &["restart", UNIT_NAME])?;
+    Ok(true)
+}
+
 /// Disables and stops the unit, removes its file and reloads systemd.
 ///
 /// # Errors
@@ -245,6 +260,25 @@ mod tests {
                 "systemctl --user daemon-reload"
             ]
         );
+    }
+
+    #[test]
+    fn restart_only_when_installed_and_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        assert!(!restart_service(&fake, dir.path()).unwrap());
+        install_service(&fake, dir.path(), Path::new("/b/tt500-lcdd"), None).unwrap();
+        fake.calls.borrow_mut().clear();
+        assert!(restart_service(&fake, dir.path()).unwrap());
+        assert_eq!(
+            fake.calls.borrow().last().map(String::as_str),
+            Some("systemctl --user restart tt500-lcd.service")
+        );
+        let stopped = Fake {
+            fail: vec!["is-active"],
+            ..Fake::default()
+        };
+        assert!(!restart_service(&stopped, dir.path()).unwrap());
     }
 
     #[test]

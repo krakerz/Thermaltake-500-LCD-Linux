@@ -1,4 +1,5 @@
-//! The crop editor: a 480:128 drawing area that is also the live panel preview.
+//! The crop editor: a drawing area in the panel's shape (480:128, or 128:480 for the portrait
+//! rotations) that is also the live panel preview, shown upright as on the mounted panel.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -7,7 +8,7 @@ use gtk::cairo;
 use gtk::prelude::*;
 use tt500_lcd_ipc::Size;
 
-use crate::geometry::{CropView, PANEL_ASPECT, fit_rect};
+use crate::geometry::{CropView, PANEL_ASPECT, fit_rect, panel_aspect};
 use crate::media::{Source, premultiplied_bgra};
 use crate::state::Framing;
 
@@ -15,6 +16,8 @@ use crate::state::Framing;
 const SCROLL_ZOOM_STEP: f64 = 1.1;
 /// Minimum height of the preview in pixels (the panel's height).
 const MIN_HEIGHT: i32 = 128;
+/// Size of the preview in the portrait modes, in pixels (the panel's 128:480, enlarged).
+const PORTRAIT_PREVIEW: (i32, i32) = (160, 600);
 
 type ViewCallback = Rc<dyn Fn(CropView)>;
 
@@ -24,6 +27,7 @@ struct State {
     display_scale: f64,
     size: Size,
     framing: Framing,
+    aspect: f64,
     view: CropView,
 }
 
@@ -48,7 +52,8 @@ impl Editor {
             display_scale: 1.0,
             size,
             framing: Framing::Crop,
-            view: CropView::new(size),
+            aspect: PANEL_ASPECT,
+            view: CropView::new(size, PANEL_ASPECT),
         }));
         let area = gtk::DrawingArea::builder()
             .content_height(MIN_HEIGHT)
@@ -76,6 +81,42 @@ impl Editor {
         editor
     }
 
+    /// Lays the editor out for the panel at rotation `step`: 480:128 for steps 0 and 2,
+    /// 128:480 for 1 and 3. The picture stays upright; the view keeps its centre at zoom 1.
+    pub fn set_rotation(&self, step: u8) {
+        let aspect = panel_aspect(step);
+        {
+            let mut state = self.state.borrow_mut();
+            state.aspect = aspect;
+            state.view = state.view.with_aspect(aspect);
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the ratios 3.75 and 0.27 fit an f32"
+        )]
+        self.frame.set_ratio(aspect as f32);
+        if step % 2 == 1 {
+            let (width, height) = PORTRAIT_PREVIEW;
+            self.area.set_content_width(width);
+            self.area.set_content_height(height);
+            self.area.set_hexpand(false);
+            self.frame.set_halign(gtk::Align::Center);
+            self.frame.set_hexpand(false);
+        } else {
+            self.area.set_content_width(0);
+            self.area.set_content_height(MIN_HEIGHT);
+            self.area.set_hexpand(true);
+            self.frame.set_halign(gtk::Align::Fill);
+            self.frame.set_hexpand(true);
+        }
+        self.area.queue_draw();
+    }
+
+    /// The aspect ratio the editor is laid out for.
+    pub fn aspect(&self) -> f64 {
+        self.state.borrow().aspect
+    }
+
     /// The widget to put in the window.
     pub fn widget(&self) -> &gtk::Widget {
         self.frame.upcast_ref()
@@ -94,7 +135,7 @@ impl Editor {
             state.display_scale =
                 f64::from(source.image.width()) / f64::from(source.size.width.max(1));
             state.size = source.size;
-            state.view = CropView::new(source.size);
+            state.view = CropView::new(source.size, state.aspect);
             state.framing = Framing::Crop;
         }
         self.update_cursor();
@@ -122,7 +163,7 @@ impl Editor {
             state.surface = None;
             state.display_scale = 1.0;
             state.size = size;
-            state.view = CropView::new(size);
+            state.view = CropView::new(size, state.aspect);
             state.framing = Framing::Crop;
         }
         self.update_cursor();

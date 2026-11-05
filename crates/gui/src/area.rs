@@ -1,6 +1,9 @@
 //! The Area tab's decisions, without GTK: the form to live source mapping and preview polling.
 
-use tt500_lcd_ipc::{DESKTOP_MAX_COMMANDS, DesktopSpec, LiveSource, Size};
+use tt500_lcd_ipc::{
+    DESKTOP_DEFAULT_SCALE, DESKTOP_DEFAULT_SIZE, DESKTOP_MAX_COMMANDS, DesktopSpec, LiveSource,
+    Size,
+};
 
 /// A virtual desktop size with its scale factor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +55,94 @@ pub fn preset_index(size: Size, scale: u8) -> Option<usize> {
         .position(|preset| preset.size == size && preset.scale == scale)
 }
 
+/// Custom size shown the first time, taller than the panel so it pans at zoom 1.
+pub const DEFAULT_CUSTOM: Geometry = Geometry {
+    size: Size {
+        width: 960,
+        height: 512,
+    },
+    scale: 1,
+};
+
+/// Label of the size row's last entry, after the [`PRESETS`].
+pub const CUSTOM_LABEL: &str = "Custom…";
+
+/// A desktop size with its scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Geometry {
+    /// Output size in physical pixels.
+    pub size: Size,
+    /// Output scale factor.
+    pub scale: u8,
+}
+
+impl Default for Geometry {
+    fn default() -> Self {
+        Self {
+            size: DESKTOP_DEFAULT_SIZE,
+            scale: DESKTOP_DEFAULT_SCALE,
+        }
+    }
+}
+
+/// The size row's choice: a preset or a custom geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeChoice {
+    /// An index into [`PRESETS`].
+    Preset(usize),
+    /// A user-typed size.
+    Custom(Geometry),
+}
+
+impl SizeChoice {
+    /// The matching preset, else a custom choice with these values.
+    #[must_use]
+    pub fn from_geometry(geometry: Geometry) -> Self {
+        preset_index(geometry.size, geometry.scale).map_or(Self::Custom(geometry), Self::Preset)
+    }
+
+    /// Position in the size row: presets first, then "Custom…".
+    #[must_use]
+    pub fn row_index(self) -> usize {
+        match self {
+            Self::Preset(index) => index,
+            Self::Custom(_) => PRESETS.len(),
+        }
+    }
+
+    /// The choice at a size row position, `custom` standing for the last entry.
+    #[must_use]
+    pub fn from_row_index(index: usize, custom: Geometry) -> Self {
+        if index < PRESETS.len() {
+            Self::Preset(index)
+        } else {
+            Self::Custom(custom)
+        }
+    }
+
+    /// Size and scale of the choice.
+    #[must_use]
+    pub fn geometry(self) -> Geometry {
+        match self {
+            Self::Preset(index) => {
+                let preset = PRESETS.get(index).unwrap_or(&PRESETS[DEFAULT_PRESET]);
+                Geometry {
+                    size: preset.size,
+                    scale: preset.scale,
+                }
+            }
+            Self::Custom(geometry) => geometry,
+        }
+    }
+}
+
+/// Whether a source of `size` has the panel's 15:4 shape, so that at zoom 1 it fits whole.
+#[must_use]
+pub fn matches_panel_shape(size: Size) -> bool {
+    // 480:128 reduced is 15:4.
+    u64::from(size.width) * 4 == u64::from(size.height) * 15
+}
+
 /// Which kind of live source the form describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AreaSource {
@@ -59,6 +150,8 @@ pub enum AreaSource {
     Desktop,
     /// A monitor of the running session.
     Screen,
+    /// A window or screen chosen in the desktop portal's picker.
+    Portal,
 }
 
 /// The Area tab's controls as plain data.
@@ -70,8 +163,8 @@ pub struct Form {
     pub output: Option<String>,
     /// Raw command rows.
     pub commands: Vec<String>,
-    /// Chosen size, an index into [`PRESETS`].
-    pub preset: Option<usize>,
+    /// Chosen desktop size.
+    pub size: SizeChoice,
 }
 
 /// The commands that count: trimmed, without blank rows.
@@ -94,15 +187,13 @@ impl Form {
             AreaSource::Screen => Ok(LiveSource::Screen {
                 output: self.output.clone(),
             }),
+            AreaSource::Portal => Ok(LiveSource::Portal { reselect: false }),
             AreaSource::Desktop => {
-                let preset = self
-                    .preset
-                    .and_then(|index| PRESETS.get(index))
-                    .ok_or("choose a desktop size")?;
+                let Geometry { size, scale } = self.size.geometry();
                 let spec = DesktopSpec {
                     commands: clean_commands(&self.commands),
-                    size: preset.size,
-                    scale: preset.scale,
+                    size,
+                    scale,
                 };
                 spec.validate()?;
                 Ok(LiveSource::Desktop(spec))
@@ -118,13 +209,22 @@ impl Form {
                 source: AreaSource::Desktop,
                 output: None,
                 commands: spec.commands.clone(),
-                preset: preset_index(spec.size, spec.scale),
+                size: SizeChoice::from_geometry(Geometry {
+                    size: spec.size,
+                    scale: spec.scale,
+                }),
             }),
             LiveSource::Screen { output } => Some(Self {
                 source: AreaSource::Screen,
                 output: output.clone(),
                 commands: Vec::new(),
-                preset: None,
+                size: SizeChoice::Preset(DEFAULT_PRESET),
+            }),
+            LiveSource::Portal { .. } => Some(Self {
+                source: AreaSource::Portal,
+                output: None,
+                commands: Vec::new(),
+                size: SizeChoice::Preset(DEFAULT_PRESET),
             }),
             _ => None,
         }
@@ -207,7 +307,7 @@ mod tests {
             source: AreaSource::Desktop,
             output: None,
             commands: commands.iter().map(|c| (*c).to_owned()).collect(),
-            preset: Some(DEFAULT_PRESET),
+            size: SizeChoice::Preset(DEFAULT_PRESET),
         }
     }
 
@@ -261,7 +361,7 @@ mod tests {
             source: AreaSource::Screen,
             output: Some("DP-1".into()),
             commands: Vec::new(),
-            preset: None,
+            size: SizeChoice::Preset(DEFAULT_PRESET),
         };
         assert_eq!(
             form.live_source(),
@@ -275,24 +375,89 @@ mod tests {
     fn a_running_source_fills_the_form_and_converts_back() {
         let live = desktop_form(&["top", "htop"]).live_source().expect("valid");
         let form = Form::from_live(&live).expect("desktop");
-        assert_eq!(form.preset, Some(DEFAULT_PRESET));
+        assert_eq!(form.size, SizeChoice::Preset(DEFAULT_PRESET));
         assert_eq!(form.live_source(), Ok(live));
-        assert!(Form::from_live(&LiveSource::Portal { reselect: false }).is_none());
+        let portal = Form::from_live(&LiveSource::Portal { reselect: true }).expect("portal");
+        assert_eq!(portal.source, AreaSource::Portal);
+        assert_eq!(
+            portal.live_source(),
+            Ok(LiveSource::Portal { reselect: false })
+        );
     }
 
     #[test]
-    fn a_custom_size_has_no_preset() {
+    fn a_custom_size_round_trips_as_custom() {
+        let geometry = Geometry {
+            size: Size {
+                width: 960,
+                height: 512,
+            },
+            scale: 1,
+        };
         let live = LiveSource::Desktop(DesktopSpec {
             commands: vec!["top".into()],
+            size: geometry.size,
+            scale: geometry.scale,
+        });
+        let form = Form::from_live(&live).expect("desktop");
+        assert_eq!(form.size, SizeChoice::Custom(geometry));
+        assert_eq!(form.size.row_index(), PRESETS.len());
+        assert_eq!(form.live_source(), Ok(live));
+    }
+
+    #[test]
+    fn an_out_of_range_custom_size_is_an_error() {
+        let mut form = desktop_form(&["top"]);
+        form.size = SizeChoice::Custom(Geometry {
             size: Size {
-                width: 600,
-                height: 160,
+                width: 100,
+                height: 512,
             },
             scale: 1,
         });
-        let form = Form::from_live(&live).expect("desktop");
-        assert_eq!(form.preset, None);
         assert!(form.live_source().is_err());
+    }
+
+    #[test]
+    fn size_choice_maps_row_positions() {
+        for index in 0..PRESETS.len() {
+            let choice = SizeChoice::from_row_index(index, DEFAULT_CUSTOM);
+            assert_eq!(choice, SizeChoice::Preset(index));
+            assert_eq!(choice.row_index(), index);
+        }
+        assert_eq!(
+            SizeChoice::from_row_index(PRESETS.len(), DEFAULT_CUSTOM),
+            SizeChoice::Custom(DEFAULT_CUSTOM)
+        );
+        assert_eq!(
+            SizeChoice::from_geometry(Geometry {
+                size: PRESETS[0].size,
+                scale: PRESETS[0].scale,
+            }),
+            SizeChoice::Preset(0)
+        );
+    }
+
+    #[test]
+    fn the_default_custom_size_is_valid_and_taller_than_the_panel() {
+        let spec = DesktopSpec {
+            commands: vec!["x".into()],
+            size: DEFAULT_CUSTOM.size,
+            scale: DEFAULT_CUSTOM.scale,
+        };
+        assert_eq!(spec.validate(), Ok(()));
+        assert!(!matches_panel_shape(DEFAULT_CUSTOM.size));
+    }
+
+    #[test]
+    fn panel_shape_detection() {
+        for preset in PRESETS {
+            assert!(matches_panel_shape(preset.size), "{}", preset.label);
+        }
+        assert!(!matches_panel_shape(Size {
+            width: 2560,
+            height: 1440,
+        }));
     }
 
     #[test]

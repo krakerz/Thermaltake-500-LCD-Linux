@@ -31,14 +31,19 @@ pub struct Framed {
 }
 
 impl Framed {
-    /// Crop mode with a centred view.
+    /// Crop mode with a centred view for a panel of `aspect` (width / height).
     #[must_use]
-    pub fn new(size: Size) -> Self {
+    pub fn new(size: Size, aspect: f64) -> Self {
         Self {
             size,
-            view: CropView::new(size),
+            view: CropView::new(size, aspect),
             framing: Framing::Crop,
         }
+    }
+
+    /// Re-lays the crop out for a panel of another `aspect`, keeping the centre.
+    pub fn set_aspect(&mut self, aspect: f64) {
+        self.view = self.view.with_aspect(aspect);
     }
 
     /// Takes framing and crop from the daemon's content when it shows this same source.
@@ -46,7 +51,7 @@ impl Framed {
         match info.crop {
             Some(crop) => {
                 self.framing = Framing::Crop;
-                self.view = CropView::from_crop(self.size, crop);
+                self.view = CropView::from_crop(self.size, crop, self.view.aspect());
             }
             None => self.framing = Framing::Fit(info.fit),
         }
@@ -180,7 +185,7 @@ mod tests {
     }
 
     fn framed() -> Framed {
-        Framed::new(size())
+        Framed::new(size(), crate::geometry::PANEL_ASPECT)
     }
 
     fn info(crop: Option<Crop>, fit: Fit, max_fps: Option<u32>) -> ContentInfo {
@@ -207,7 +212,9 @@ mod tests {
             device,
             content: None,
             brightness: 50,
+            rotation: None,
             content_error: None,
+            profile: None,
         }
     }
 

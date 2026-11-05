@@ -6,6 +6,7 @@ mod decode;
 mod encode;
 mod fit;
 mod media;
+mod rotate;
 mod video;
 
 use std::fs;
@@ -16,13 +17,14 @@ use std::time::Duration;
 use image::imageops::{self, FilterType};
 use image::{RgbImage, RgbaImage};
 use tt500_lcd_protocol::{
-    BootAnimation, BootError, Frame, FrameError, MAX_BOOT_FRAMES, StandbyImage,
+    BootAnimation, BootError, Frame, FrameError, MAX_BOOT_FRAMES, Rotation, StandbyImage,
 };
 
 pub use crop::Crop;
 pub use fit::Fit;
 pub use media::{MediaKind, detect};
-pub use video::{VideoInfo, VideoPoll, VideoStream, probe};
+pub use rotate::{canvas_size, is_portrait};
+pub use video::{DecodePath, HWDEC_ENV, VideoInfo, VideoPoll, VideoStream, probe};
 
 /// Largest image or animation file read, in bytes (videos are streamed, not read).
 pub const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -47,6 +49,9 @@ pub struct RenderOptions {
     /// Frame-rate cap the user asked for, used clamped to 1..=[`MAX_FPS`]. `None`: animations
     /// keep their own frame timing (only limited to [`MAX_FPS`]) and videos use [`DEFAULT_FPS`].
     pub max_fps: Option<u32>,
+    /// Panel rotation step. The source is fitted to [`canvas_size`] (portrait for steps 1 and
+    /// 3; crop rectangles stay in source pixels) and then turned into the 480x128 frame.
+    pub rotation: Rotation,
 }
 
 impl Default for RenderOptions {
@@ -57,6 +62,7 @@ impl Default for RenderOptions {
             quality: 90,
             crop: None,
             max_fps: None,
+            rotation: Rotation::default(),
         }
     }
 }
@@ -234,17 +240,8 @@ pub fn render_standby_bytes(
         crop.check(width, height)?;
     }
     let flat = decode::flatten(&img, options.background);
-    let source = match options.crop {
-        Some(c) => imageops::crop_imm(&flat, c.x, c.y, c.width, c.height).to_image(),
-        None => flat,
-    };
-    let fitted = fit::fit_image(
-        &source,
-        options.fit,
-        options.background,
-        FilterType::Lanczos3,
-    );
-    encode::encode_standby(&compose(fitted), options.quality)
+    let panel = crop_and_fit(flat, options, FilterType::Lanczos3);
+    encode::encode_standby(&panel, options.quality)
 }
 
 /// A rendered boot animation and how the source was cut down.
@@ -380,26 +377,34 @@ fn prepare(img: &RgbaImage, options: &RenderOptions, filter: FilterType) -> RgbI
     crop_and_fit(flat, options, filter)
 }
 
-/// Crops (when requested) and fits an opaque image to the panel size.
+/// Crops (when requested), fits an opaque image to the rotation's canvas and turns it into a
+/// panel-sized (480x128) image.
 fn crop_and_fit(img: RgbImage, options: &RenderOptions, filter: FilterType) -> RgbImage {
     let source = match options.crop {
         Some(c) => imageops::crop_imm(&img, c.x, c.y, c.width, c.height).to_image(),
         None => img,
     };
-    compose(fit::fit_image(
+    let canvas = fit::fit_image(
         &source,
         options.fit,
         options.background,
         filter,
-    ))
+        canvas_size(options.rotation),
+    );
+    compose(rotate::to_panel(canvas, options.rotation))
 }
 
-/// Encodes a frame that is already panel-sized (the video path).
-pub(crate) fn render_panel_rgb(rgb: RgbImage, quality: u8) -> Result<Frame, RenderError> {
-    encode::encode_frame(&compose(rgb), quality)
+/// Turns a decoded video frame already fitted to the rotation's canvas into a panel frame.
+pub(crate) fn render_canvas_rgb(
+    canvas: RgbImage,
+    rotation: Rotation,
+    quality: u8,
+) -> Result<Frame, RenderError> {
+    encode::encode_frame(&compose(rotate::to_panel(canvas, rotation)), quality)
 }
 
-/// Shapes one opaque full-source frame (a live capture) into a panel frame: crop, fit, JPEG.
+/// Shapes one opaque full-source frame (a live capture) into a panel frame: crop, fit, rotate,
+/// JPEG.
 ///
 /// Uses the fast triangle filter, as it runs at video rates.
 ///
@@ -416,7 +421,7 @@ pub fn render_rgb_frame(img: &RgbImage, options: &RenderOptions) -> Result<Frame
     encode::encode_frame(&shaped, options.quality)
 }
 
-/// Encodes a preview JPEG (quality 80) of `img`, downscaled to `max_width` when wider.
+/// Encodes a preview JPEG (quality 85) of `img`, downscaled to `max_width` when wider.
 ///
 /// # Errors
 ///
@@ -804,5 +809,80 @@ mod tests {
     fn garbage_is_unsupported() {
         let err = render_bytes(b"definitely not an image", &RenderOptions::default()).unwrap_err();
         assert!(matches!(err, RenderError::Unsupported));
+    }
+
+    /// Colours near the four corners (inset 8 px) of a decoded panel frame.
+    fn decoded_corners(frame: &Frame) -> [[u8; 3]; 4] {
+        let img = image::load_from_memory_with_format(frame.as_bytes(), ImageFormat::Jpeg)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(img.dimensions(), (480, 128));
+        let (w, h) = img.dimensions();
+        [(8, 8), (w - 9, 8), (8, h - 9), (w - 9, h - 9)].map(|(x, y)| img.get_pixel(x, y).0)
+    }
+
+    fn quadrant_source(w: u32, h: u32) -> RgbImage {
+        RgbImage::from_fn(w, h, |x, y| match (x < w / 2, y < h / 2) {
+            (true, true) => Rgb([255, 0, 0]),
+            (false, true) => Rgb([0, 255, 0]),
+            (true, false) => Rgb([0, 0, 255]),
+            (false, false) => Rgb([255, 255, 255]),
+        })
+    }
+
+    fn near(got: [u8; 3], want: [u8; 3]) -> bool {
+        got.iter().zip(want).all(|(g, w)| g.abs_diff(w) < 40)
+    }
+
+    fn assert_corners(frame: &Frame, want: [[u8; 3]; 4]) {
+        let got = decoded_corners(frame);
+        for (g, w) in got.into_iter().zip(want) {
+            assert!(near(g, w), "got {got:?}, want {want:?}");
+        }
+    }
+
+    #[test]
+    fn rgb_frames_are_rotated_per_step() {
+        const R: [u8; 3] = [255, 0, 0];
+        const G: [u8; 3] = [0, 255, 0];
+        const B: [u8; 3] = [0, 0, 255];
+        const W: [u8; 3] = [255, 255, 255];
+        let landscape = quadrant_source(480, 128);
+        let portrait = quadrant_source(128, 480);
+        let render = |img: &RgbImage, step: u8| {
+            let options = RenderOptions {
+                rotation: Rotation::try_from(step).unwrap(),
+                ..RenderOptions::default()
+            };
+            render_rgb_frame(img, &options).unwrap()
+        };
+        assert_corners(&render(&landscape, 0), [R, G, B, W]);
+        assert_corners(&render(&landscape, 2), [W, B, G, R]);
+        assert_corners(&render(&portrait, 1), [B, R, W, G]);
+        assert_corners(&render(&portrait, 3), [G, W, R, B]);
+    }
+
+    #[test]
+    fn portrait_steps_fit_the_source_to_a_portrait_canvas() {
+        // A wide source cropped to a portrait window: the crop rectangle is in source pixels.
+        let img = quadrant_source(1000, 500);
+        let options = RenderOptions {
+            rotation: Rotation::try_from(1).unwrap(),
+            crop: Some(Crop {
+                x: 0,
+                y: 0,
+                width: 500,
+                height: 500,
+            }),
+            ..RenderOptions::default()
+        };
+        // The 500x500 crop covers the portrait canvas, so only the red/blue left half shows
+        // (red top, blue bottom); turned clockwise: blue on the left, red on the right.
+        let frame = render_rgb_frame(&img, &options).unwrap();
+        let got = decoded_corners(&frame);
+        assert!(
+            near(got[0], [0, 0, 255]) && near(got[1], [255, 0, 0]),
+            "{got:?}"
+        );
     }
 }

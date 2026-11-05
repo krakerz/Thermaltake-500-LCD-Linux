@@ -1,14 +1,17 @@
 //! Decodes animations and streams video frames for the live preview, without GTK.
 
-use std::ffi::OsString;
+use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Cursor, Read};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::mem;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use image::codecs::gif::GifDecoder;
 use image::codecs::png::PngDecoder;
@@ -18,13 +21,12 @@ use image::{AnimationDecoder, ImageFormat, ImageResult, RgbaImage, guess_format}
 use tt500_lcd_ipc::{MAX_FPS, Size};
 
 use crate::media::{LoadError, MAX_IMAGE_BYTES, decode_error, premultiplied_bgra};
+use crate::settings::HwDecode;
 
 /// Widest preview frame; larger sources are downscaled for drawing only.
 pub const PREVIEW_MAX_WIDTH: u32 = 1280;
 /// Tallest preview frame.
 pub const PREVIEW_MAX_HEIGHT: u32 = 720;
-/// Frame rate of the video preview (changing it would restart ffmpeg).
-pub const VIDEO_PREVIEW_FPS: u32 = 15;
 
 /// Memory cap for the decoded frames of one animation.
 const MAX_ANIMATION_BYTES: usize = 256 * 1024 * 1024;
@@ -196,23 +198,38 @@ fn shrink(image: RgbaImage) -> RgbaImage {
 }
 
 /// The ffmpeg arguments that stream `path` as endless raw RGBA frames on stdout.
+///
+/// With a VA-API render node in `vaapi` the video is decoded and scaled on the GPU.
 #[must_use]
-pub fn video_args(path: &Path, width: u32, height: u32, fps: u32) -> Vec<OsString> {
-    let mut args: Vec<OsString> = [
-        "-hide_banner",
-        "-nostdin",
-        "-loglevel",
-        "error",
-        "-stream_loop",
-        "-1",
-        "-i",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect();
+pub fn video_args(
+    path: &Path,
+    width: u32,
+    height: u32,
+    fps: u32,
+    vaapi: Option<&Path>,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["-hide_banner", "-nostdin", "-loglevel", "error"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    if let Some(device) = vaapi {
+        args.extend(
+            ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        args.push("-hwaccel_device".into());
+        args.push(device.into());
+    }
+    args.extend(["-stream_loop", "-1", "-i"].into_iter().map(OsString::from));
     let mut url = OsString::from("file:");
     url.push(path);
     args.push(url);
+    let filter = if vaapi.is_some() {
+        format!("fps={fps},scale_vaapi=w={width}:h={height}:format=nv12,hwdownload,format=nv12")
+    } else {
+        format!("fps={fps},scale={width}:{height}:flags=bilinear")
+    };
     args.extend(
         [
             "-map",
@@ -220,7 +237,7 @@ pub fn video_args(path: &Path, width: u32, height: u32, fps: u32) -> Vec<OsStrin
             "-an",
             "-sn",
             "-vf",
-            &format!("fps={fps},scale={width}:{height}:flags=bilinear"),
+            filter.as_str(),
             "-pix_fmt",
             "rgba",
             "-f",
@@ -233,65 +250,206 @@ pub fn video_args(path: &Path, width: u32, height: u32, fps: u32) -> Vec<OsStrin
     args
 }
 
+/// The render node to decode on, or `None` for software decoding: hardware decoding is off in
+/// the settings, the environment (`TT500_LCD_HWDEC=0`) forces software, or there is no node.
+#[must_use]
+pub fn vaapi_device(
+    choice: HwDecode,
+    env: Option<&OsStr>,
+    nodes: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    let forced_off = env.is_some_and(|v| {
+        ["0", "false", "off", "no"]
+            .iter()
+            .any(|off| v.eq_ignore_ascii_case(off))
+    });
+    if choice == HwDecode::Off || forced_off {
+        return None;
+    }
+    let mut nodes: Vec<PathBuf> = nodes.into_iter().collect();
+    nodes.sort();
+    nodes.into_iter().next()
+}
+
+/// The DRM render nodes of this machine.
+fn render_nodes() -> Vec<PathBuf> {
+    fs::read_dir("/dev/dri")
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("renderD"))
+        .map(|e| e.path())
+        .collect()
+}
+
+/// How long the window may stay unfocused before the preview pauses.
+pub const UNFOCUSED_PAUSE_AFTER: Duration = Duration::from_secs(2);
+
+/// Decides when the preview's ffmpeg should run.
+#[derive(Debug, Default)]
+pub struct PauseGate {
+    unfocused_since: Option<Instant>,
+}
+
+impl PauseGate {
+    /// Whether the preview should play at `now`. A hidden window always pauses; an unfocused
+    /// one only after [`UNFOCUSED_PAUSE_AFTER`], and only if `pause_unfocused`.
+    pub fn should_play(
+        &mut self,
+        now: Instant,
+        visible: bool,
+        focused: bool,
+        pause_unfocused: bool,
+    ) -> bool {
+        if !visible {
+            self.unfocused_since = None;
+            return false;
+        }
+        if focused || !pause_unfocused {
+            self.unfocused_since = None;
+            return true;
+        }
+        let since = *self.unfocused_since.get_or_insert(now);
+        now.duration_since(since) <= UNFOCUSED_PAUSE_AFTER
+    }
+}
+
+/// The running ffmpeg, shared so [`VideoPreview`]'s drop can kill whichever attempt is live.
+#[derive(Debug, Default)]
+struct Running {
+    child: Mutex<Option<Child>>,
+    stopped: AtomicBool,
+}
+
+impl Running {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Child>> {
+        self.child.lock().expect("lock poisoned")
+    }
+}
+
 /// A running ffmpeg that streams a looping video as preview frames.
 ///
-/// Dropping it kills and reaps the ffmpeg child.
+/// Dropping it kills and reaps the ffmpeg child. If the GUI is killed instead, ffmpeg dies of
+/// SIGPIPE at its next write to the closed pipe (the code forbids `unsafe`, so no `pdeathsig`).
 pub struct VideoPreview {
-    child: Child,
+    running: Arc<Running>,
     frames: mpsc::Receiver<Frame>,
+    hardware: bool,
 }
 
 impl fmt::Debug for VideoPreview {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VideoPreview")
-            .field("pid", &self.child.id())
+            .field("hardware", &self.hardware)
             .finish_non_exhaustive()
     }
 }
 
+fn spawn_child(
+    path: &Path,
+    (width, height): (u32, u32),
+    fps: u32,
+    vaapi: Option<&Path>,
+) -> Result<(Child, ChildStdout), LoadError> {
+    let mut child = Command::new("ffmpeg")
+        .args(video_args(path, width, height, fps, vaapi))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => LoadError::MissingFfmpeg,
+            _ => LoadError::Io(e),
+        })?;
+    let Some(stdout) = child.stdout.take() else {
+        // Not reachable with Stdio::piped(); reap the child anyway.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(LoadError::Video("no output pipe".into()));
+    };
+    Ok((child, stdout))
+}
+
+/// Reads frames until the pipe closes or the receiver is gone; whether any frame arrived.
+fn read_frames(
+    mut stdout: ChildStdout,
+    (width, height): (u32, u32),
+    sender: &mpsc::SyncSender<Frame>,
+) -> bool {
+    let frame_len = width as usize * height as usize * 4;
+    let mut buf = vec![0_u8; frame_len];
+    let mut any = false;
+    while stdout.read_exact(&mut buf).is_ok() {
+        let Some(image) =
+            RgbaImage::from_raw(width, height, mem::replace(&mut buf, vec![0; frame_len]))
+        else {
+            return any;
+        };
+        any = true;
+        let frame = Frame {
+            width,
+            height,
+            bgra: premultiplied_bgra(&image),
+        };
+        if sender.send(frame).is_err() {
+            break;
+        }
+    }
+    any
+}
+
 impl VideoPreview {
-    /// Starts ffmpeg on the video at `path`, whose first frame has `size`.
+    /// Starts ffmpeg on the video at `path`, whose first frame has `size`, at `fps` (1..=30).
+    ///
+    /// With hardware decoding allowed and a render node present it tries VA-API first; if that
+    /// ffmpeg ends before producing a frame, a software ffmpeg takes over.
     ///
     /// # Errors
     /// Returns [`LoadError::MissingFfmpeg`] when ffmpeg is not installed, or
     /// [`LoadError::Io`] when it cannot be started.
-    pub fn spawn(path: &Path, size: Size) -> Result<Self, LoadError> {
-        let (width, height) = preview_size(size);
-        let mut child = Command::new("ffmpeg")
-            .args(video_args(path, width, height, VIDEO_PREVIEW_FPS))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| match e.kind() {
-                io::ErrorKind::NotFound => LoadError::MissingFfmpeg,
-                _ => LoadError::Io(e),
-            })?;
-        let Some(mut stdout) = child.stdout.take() else {
-            // Not reachable with Stdio::piped(); reap the child anyway.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(LoadError::Video("no output pipe".into()));
-        };
-        let (sender, frames) = mpsc::sync_channel(VIDEO_BUFFER_FRAMES);
-        let frame_len = width as usize * height as usize * 4;
-        thread::spawn(move || {
-            let mut buf = vec![0_u8; frame_len];
-            while stdout.read_exact(&mut buf).is_ok() {
-                let Some(image) = RgbaImage::from_raw(width, height, buf.clone()) else {
-                    return;
-                };
-                let frame = Frame {
-                    width,
-                    height,
-                    bgra: premultiplied_bgra(&image),
-                };
-                if sender.send(frame).is_err() {
-                    return;
-                }
-            }
+    pub fn spawn(path: &Path, size: Size, fps: u32, hw: HwDecode) -> Result<Self, LoadError> {
+        let dims = preview_size(size);
+        let fps = fps.clamp(1, 30);
+        let device = vaapi_device(
+            hw,
+            env::var_os("TT500_LCD_HWDEC").as_deref(),
+            render_nodes(),
+        );
+        let (child, stdout) = spawn_child(path, dims, fps, device.as_deref())?;
+        let running = Arc::new(Running {
+            child: Mutex::new(Some(child)),
+            ..Running::default()
         });
-        Ok(Self { child, frames })
+        let (sender, frames) = mpsc::sync_channel(VIDEO_BUFFER_FRAMES);
+        let hardware = device.is_some();
+        let supervisor = Arc::clone(&running);
+        let path = path.to_path_buf();
+        // The reader ends on its own once the pipe closes; it is never joined.
+        thread::spawn(move || {
+            let produced = read_frames(stdout, dims, &sender);
+            if produced || !hardware {
+                return;
+            }
+            tracing::info!("VA-API preview decoding failed; using software decoding");
+            let mut slot = supervisor.lock();
+            if supervisor.stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Some(mut dead) = slot.take() {
+                let _ = dead.wait();
+            }
+            let Ok((child, stdout)) = spawn_child(&path, dims, fps, None) else {
+                return;
+            };
+            *slot = Some(child);
+            drop(slot);
+            read_frames(stdout, dims, &sender);
+        });
+        Ok(Self {
+            running,
+            frames,
+            hardware,
+        })
     }
 
     /// The next decoded frame, if one is ready.
@@ -303,9 +461,12 @@ impl VideoPreview {
 
 impl Drop for VideoPreview {
     fn drop(&mut self) {
-        // The reader thread ends on its own once the pipe closes; never join it.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let mut slot = self.running.lock();
+        self.running.stopped.store(true, Ordering::SeqCst);
+        if let Some(mut child) = slot.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -376,7 +537,7 @@ mod tests {
 
     #[test]
     fn video_args_are_exact() {
-        let args = video_args(Path::new("/tmp/a b.mp4"), 640, 360, 15);
+        let args = video_args(Path::new("/tmp/a b.mp4"), 640, 360, 10, None);
         let args: Vec<&str> = args.iter().map(|a| a.to_str().expect("utf-8")).collect();
         assert_eq!(
             args,
@@ -394,7 +555,7 @@ mod tests {
                 "-an",
                 "-sn",
                 "-vf",
-                "fps=15,scale=640:360:flags=bilinear",
+                "fps=10,scale=640:360:flags=bilinear",
                 "-pix_fmt",
                 "rgba",
                 "-f",
@@ -402,6 +563,67 @@ mod tests {
                 "pipe:1",
             ]
         );
+    }
+
+    #[test]
+    fn hardware_args_decode_and_scale_on_the_gpu() {
+        let args = video_args(
+            Path::new("/v.mp4"),
+            640,
+            360,
+            10,
+            Some(Path::new("/dev/dri/renderD128")),
+        );
+        let args: Vec<&str> = args.iter().map(|a| a.to_str().expect("utf-8")).collect();
+        let hw = args
+            .iter()
+            .position(|a| *a == "-hwaccel")
+            .expect("-hwaccel");
+        let input = args.iter().position(|a| *a == "-i").expect("-i");
+        assert!(hw < input);
+        assert!(args.contains(&"/dev/dri/renderD128"));
+        assert!(
+            args.contains(&"fps=10,scale_vaapi=w=640:h=360:format=nv12,hwdownload,format=nv12")
+        );
+    }
+
+    #[test]
+    fn vaapi_needs_a_node_and_no_opt_out() {
+        let nodes = || {
+            [
+                PathBuf::from("/dev/dri/renderD129"),
+                PathBuf::from("/dev/dri/renderD128"),
+            ]
+        };
+        assert_eq!(
+            vaapi_device(HwDecode::Auto, None, nodes()),
+            Some(PathBuf::from("/dev/dri/renderD128"))
+        );
+        assert_eq!(vaapi_device(HwDecode::Off, None, nodes()), None);
+        assert_eq!(
+            vaapi_device(HwDecode::Auto, Some(OsStr::new("0")), nodes()),
+            None
+        );
+        assert!(vaapi_device(HwDecode::Auto, Some(OsStr::new("1")), nodes()).is_some());
+        assert_eq!(vaapi_device(HwDecode::Auto, None, []), None);
+    }
+
+    #[test]
+    fn unfocused_windows_pause_after_the_grace_period() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut gate = PauseGate::default();
+        assert!(gate.should_play(at(0), true, true, true));
+        // Focus lost: still playing within 2 s, paused after.
+        assert!(gate.should_play(at(100), true, false, true));
+        assert!(gate.should_play(at(2_100), true, false, true));
+        assert!(!gate.should_play(at(2_200), true, false, true));
+        // Regaining focus resumes at once and restarts the grace period.
+        assert!(gate.should_play(at(3_000), true, true, true));
+        assert!(gate.should_play(at(3_100), true, false, true));
+        // The setting off: only hidden pauses.
+        assert!(gate.should_play(at(9_000), true, false, false));
+        assert!(!gate.should_play(at(9_001), false, true, false));
     }
 
     #[test]
@@ -425,7 +647,8 @@ mod tests {
             .status()
             .expect("run ffmpeg");
         assert!(status.success());
-        let preview = VideoPreview::spawn(&path, size(640, 360)).expect("spawns");
+        let preview =
+            VideoPreview::spawn(&path, size(640, 360), 10, HwDecode::Auto).expect("spawns");
         let start = Instant::now();
         let frame = loop {
             if let Some(frame) = preview.try_frame() {

@@ -8,6 +8,10 @@ pub enum CaptureError {
     /// The compositor or output vanished; the caller should reconnect.
     #[error("capture source is gone: {0}")]
     Gone(String),
+    /// The user or the compositor ended the source for good; reconnecting would only ask the
+    /// user again, so the stream stops with this message.
+    #[error("{0}")]
+    Closed(String),
     /// This capture failed; trying again may work.
     #[error("capture failed: {0}")]
     Failed(String),

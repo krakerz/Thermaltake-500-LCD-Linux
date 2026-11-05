@@ -6,7 +6,7 @@ use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use tt500_lcd_ipc::{Request, Status};
+use tt500_lcd_ipc::{Profile, Request, Status};
 
 use crate::daemon;
 
@@ -58,6 +58,8 @@ pub(super) struct Context {
     pub socket: Result<PathBuf, String>,
     /// Latest status; `None` while the daemon is unreachable.
     pub status: RefCell<Option<Status>>,
+    /// Saved profiles in the daemon's order, as of the last [`Self::reload_profiles`].
+    pub profiles: RefCell<Vec<Profile>>,
     pub toasts: adw::ToastOverlay,
     pub window: adw::ApplicationWindow,
     current_toast: RefCell<Option<adw::Toast>>,
@@ -68,6 +70,7 @@ impl Context {
         Rc::new(Self {
             socket: tt500_lcd_ipc::socket_path().map_err(|error| error.to_string()),
             status: RefCell::new(None),
+            profiles: RefCell::new(Vec::new()),
             toasts,
             window,
             current_toast: RefCell::new(None),
@@ -122,6 +125,29 @@ impl Context {
             match result {
                 Ok(Ok(())) if success.is_empty() => {}
                 Ok(Ok(())) => ctx.toast(success),
+                Ok(Err(message)) => ctx.toast(&message),
+                Err(_) => ctx.toast("The request failed"),
+            }
+        });
+    }
+
+    /// Fetches the profile list on a worker thread, stores it, then calls `done`.
+    /// Shows the error as a toast (and does not call `done`) when the request fails.
+    pub fn reload_profiles(self: &Rc<Self>, done: impl Fn() + 'static) {
+        let socket = match &self.socket {
+            Ok(socket) => socket.clone(),
+            Err(reason) => {
+                self.toast(reason);
+                return;
+            }
+        };
+        let ctx = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            match gio::spawn_blocking(move || daemon::profiles(&socket)).await {
+                Ok(Ok(reply)) => {
+                    *ctx.profiles.borrow_mut() = reply.profiles;
+                    done();
+                }
                 Ok(Err(message)) => ctx.toast(&message),
                 Err(_) => ctx.toast("The request failed"),
             }

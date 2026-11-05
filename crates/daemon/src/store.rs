@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tt500_lcd_ipc::{
-    ContentInfo, ContentKind, Crop, ErrorCode, Fit, IpcError, LiveSource, ShowLiveParams, Size,
+    ContentInfo, ContentKind, Crop, ErrorCode, Fit, IpcError, LiveSource, ProfileSource,
+    ProfileSpec, ShowLiveParams, Size,
 };
-use tt500_lcd_protocol::{Brightness, StandbyImage};
+use tt500_lcd_protocol::{Brightness, Rotation, StandbyImage};
 use tt500_lcd_render::{
     MediaKind, Playlist, RenderError, RenderOptions, RenderedBoot, VideoStream,
 };
@@ -33,6 +34,9 @@ struct State {
     version: u32,
     #[serde(default = "default_brightness")]
     brightness: u8,
+    /// Rotation step 0..=3; a TOML scalar, so it stays above the `[content]` table.
+    #[serde(default)]
+    rotation: u8,
     content: Option<StoredContent>,
 }
 
@@ -41,6 +45,7 @@ impl Default for State {
         Self {
             version: STATE_VERSION,
             brightness: default_brightness(),
+            rotation: Rotation::default().get(),
             content: None,
         }
     }
@@ -159,6 +164,21 @@ impl ContentStore {
             .map_err(|err| internal(&format!("cannot save state: {err}")))
     }
 
+    /// The stored rotation step; missing or out of range gives 0.
+    pub fn rotation(&self) -> Rotation {
+        let _guard = self.lock.lock().expect("lock poisoned");
+        Rotation::try_from(self.read_state().rotation).unwrap_or_default()
+    }
+
+    /// Persists the rotation, keeping the stored content.
+    pub fn set_rotation(&self, rotation: Rotation) -> Result<(), IpcError> {
+        let _guard = self.lock.lock().expect("lock poisoned");
+        let mut state = self.read_state();
+        state.rotation = rotation.get();
+        self.write_state(&state)
+            .map_err(|err| internal(&format!("cannot save state: {err}")))
+    }
+
     /// Renders `src` (or starts it, for a video) and records it; images and animations are also copied.
     pub fn replace(
         &self,
@@ -178,7 +198,8 @@ impl ContentStore {
             crop,
             max_fps,
         };
-        let (content, info) = load(src, settings).map_err(|err| render_error(&err))?;
+        let rotation = self.rotation();
+        let (content, info) = load(src, settings, rotation).map_err(|err| render_error(&err))?;
 
         let _guard = self.lock.lock().expect("lock poisoned");
         let file = (info.kind != ContentKind::Video)
@@ -225,8 +246,8 @@ impl ContentStore {
         crop: Option<Crop>,
     ) -> Result<StandbyImage, IpcError> {
         check_source(src)?;
-        tt500_lcd_render::render_standby_file(src, &render_options(fit, crop, None))
-            .map_err(|err| render_error(&err))
+        let options = render_options(fit, crop, None, self.rotation());
+        tt500_lcd_render::render_standby_file(src, &options).map_err(|err| render_error(&err))
     }
 
     /// Renders the animation at `src` as a boot animation; nothing is stored.
@@ -237,7 +258,8 @@ impl ContentStore {
         crop: Option<Crop>,
     ) -> Result<RenderedBoot, IpcError> {
         check_source(src)?;
-        tt500_lcd_render::render_boot_animation_file(src, &render_options(fit, crop, None))
+        let options = render_options(fit, crop, None, self.rotation());
+        tt500_lcd_render::render_boot_animation_file(src, &options)
             .map_err(|err| render_error(&err))
     }
 
@@ -282,12 +304,41 @@ impl ContentStore {
         }
     }
 
+    /// The persisted state as a profile spec (brightness, rotation and content), read from
+    /// `state.toml` rather than from the live status, which may not be restored yet.
+    pub fn stored_spec(&self) -> ProfileSpec {
+        let _guard = self.lock.lock().expect("lock poisoned");
+        let state = self.read_state();
+        let mut spec = ProfileSpec {
+            brightness: Some(state.brightness),
+            rotation: Some(state.rotation),
+            ..ProfileSpec::default()
+        };
+        let Some(stored) = state.content else {
+            spec.source = Some(ProfileSource::Clear);
+            return spec;
+        };
+        spec.fit = stored.fit;
+        spec.crop = stored.crop;
+        spec.fps = stored.max_fps;
+        if let Some(source) = stored.live {
+            spec.steady = stored.steady;
+            spec.source = Some(ProfileSource::Live { source });
+        } else {
+            // Without an original path the content cannot be shown again; keep it as it is.
+            spec.source = stored.origin.map(|path| ProfileSource::Static { path });
+        }
+        spec
+    }
+
     /// Reloads the persisted content. A missing video file or a missing ffmpeg keeps the
     /// record (the file may come back, e.g. on a drive mounted later); any other failure
     /// clears it. Every failure is reported for the status.
     pub fn restore(&self) -> Restored {
         let _guard = self.lock.lock().expect("lock poisoned");
-        let Some(stored) = self.read_state().content else {
+        let state = self.read_state();
+        let rotation = Rotation::try_from(state.rotation).unwrap_or_default();
+        let Some(stored) = state.content else {
             return Restored::Nothing;
         };
         if let Some(source) = stored.live {
@@ -326,7 +377,7 @@ impl ContentStore {
             crop: stored.crop,
             max_fps: stored.max_fps,
         };
-        match load(&path, settings) {
+        match load(&path, settings, rotation) {
             Ok((content, info)) => Restored::Loaded(content, info),
             Err(err @ RenderError::MissingFfmpeg) => {
                 tracing::warn!("cannot restore {}: {err}", path.display());
@@ -368,7 +419,13 @@ fn check_source(src: &Path) -> Result<(), IpcError> {
     Ok(())
 }
 
-pub fn render_options(fit: Fit, crop: Option<Crop>, max_fps: Option<u32>) -> RenderOptions {
+/// The render options for content shown with these settings on a panel at `rotation`.
+pub fn render_options(
+    fit: Fit,
+    crop: Option<Crop>,
+    max_fps: Option<u32>,
+    rotation: Rotation,
+) -> RenderOptions {
     RenderOptions {
         fit: match fit {
             Fit::Cover => tt500_lcd_render::Fit::Cover,
@@ -382,12 +439,17 @@ pub fn render_options(fit: Fit, crop: Option<Crop>, max_fps: Option<u32>) -> Ren
             height: c.height,
         }),
         max_fps,
+        rotation,
         ..RenderOptions::default()
     }
 }
 
 /// Renders an image or animation, or starts a video, and describes the result.
-fn load(path: &Path, settings: Settings) -> Result<(Content, ContentInfo), RenderError> {
+fn load(
+    path: &Path,
+    settings: Settings,
+    rotation: Rotation,
+) -> Result<(Content, ContentInfo), RenderError> {
     let Settings {
         source,
         origin,
@@ -395,7 +457,7 @@ fn load(path: &Path, settings: Settings) -> Result<(Content, ContentInfo), Rende
         crop,
         max_fps,
     } = settings;
-    let options = render_options(fit, crop, max_fps);
+    let options = render_options(fit, crop, max_fps, rotation);
     match tt500_lcd_render::detect(path)? {
         MediaKind::Image => {
             let rendered = tt500_lcd_render::render_file(path, &options)?;
@@ -430,10 +492,11 @@ fn load(path: &Path, settings: Settings) -> Result<(Content, ContentInfo), Rende
             let video = tt500_lcd_render::probe(path)?;
             let stream = VideoStream::spawn(path, &video, &options)?;
             tracing::info!(
-                "playing {source}: {}x{} at {} fps (ffmpeg pid {:?})",
+                "playing {source}: {}x{} at {} fps via {} (ffmpeg pid {:?})",
                 video.width,
                 video.height,
                 video.playback_fps(options.video_fps_cap()),
+                stream.decode_path(),
                 stream.process_id()
             );
             let info = ContentInfo {
@@ -552,6 +615,31 @@ mod tests {
             .set_brightness(Brightness::try_from(40).unwrap())
             .unwrap();
         assert_eq!(store.brightness().get(), 40);
+    }
+
+    #[test]
+    fn rotation_defaults_persists_and_survives_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        assert_eq!(store.rotation().get(), 0);
+        store.set_rotation(Rotation::try_from(2).unwrap()).unwrap();
+        assert_eq!(store.rotation().get(), 2);
+        store
+            .set_brightness(Brightness::try_from(40).unwrap())
+            .unwrap();
+        assert_eq!(store.rotation().get(), 2);
+        let text = fs::read_to_string(store.state_path()).unwrap();
+        assert!(text.contains("rotation = 2"), "{text}");
+    }
+
+    #[test]
+    fn out_of_range_rotation_falls_back_to_0() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        fs::create_dir_all(tmp.path().join("state")).ok();
+        let text = "version = 1\nrotation = 9\n";
+        fs::write(store.state_path(), text).unwrap();
+        assert_eq!(store.rotation().get(), 0);
     }
 
     #[test]
@@ -826,5 +914,21 @@ mod tests {
         let text = "version = 1\nbrightness = 50\n[content]\nsource = \"a.png\"\nfit = \"cover\"\n";
         let state: State = toml::from_str(text).unwrap();
         assert!(state.content.unwrap().live.is_none());
+    }
+
+    #[test]
+    fn stored_spec_follows_the_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        store.set_rotation(Rotation::try_from(2).unwrap()).unwrap();
+        let spec = store.stored_spec();
+        assert_eq!(spec.source, Some(ProfileSource::Clear));
+        assert_eq!(spec.brightness, Some(100));
+        assert_eq!(spec.rotation, Some(2));
+        let path = png(tmp.path(), "a.png");
+        store.replace(&path, Fit::Cover, None, None).unwrap();
+        let spec = store.stored_spec();
+        assert_eq!(spec.fit, Fit::Cover);
+        assert_eq!(spec.source, Some(ProfileSource::Static { path }));
     }
 }

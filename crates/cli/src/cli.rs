@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum, value_parser};
-use tt500_lcd_ipc::{Crop, Fit, MAX_FPS, Size};
+use tt500_lcd_ipc::{Crop, Fit, MAX_FPS, Size, TimeOfDay, Weekday};
 
 /// Control the Thermaltake Tower 500 LCD panel daemon.
 #[derive(Debug, Parser)]
@@ -70,6 +70,26 @@ pub enum Command {
         #[arg(long, value_parser = Fit::from_str, default_value_t = Fit::Cover)]
         fit: Fit,
         /// Show only this region of the screen, in screen pixels, before fitting
+        #[arg(long, value_parser = Crop::from_str, value_name = "X,Y,W,H")]
+        crop: Option<Crop>,
+        /// Capture frame rate, 1-30
+        #[arg(long, value_parser = value_parser!(u32).range(1..=i64::from(MAX_FPS)))]
+        fps: Option<u32>,
+        #[command(flatten)]
+        steady: SteadyArgs,
+    },
+    /// Mirror a window or screen chosen in the desktop portal's picker
+    ///
+    /// The first run asks which window or screen to share; the daemon remembers the choice.
+    /// Needs GStreamer with the PipeWire plugin. Stops when the shared window is closed.
+    ShowPortal {
+        /// Forget the remembered choice and ask again
+        #[arg(long)]
+        reselect: bool,
+        /// How to fit the capture onto the 480x128 panel
+        #[arg(long, value_parser = Fit::from_str, default_value_t = Fit::Cover)]
+        fit: Fit,
+        /// Show only this region of the capture, in pixels, before fitting
         #[arg(long, value_parser = Crop::from_str, value_name = "X,Y,W,H")]
         crop: Option<Crop>,
         /// Capture frame rate, 1-30
@@ -156,12 +176,23 @@ pub enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Save and switch display profiles
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
     /// Stop streaming; the panel falls back to its stored image (brightness is kept)
     Clear,
     /// Set the panel brightness in percent (0 turns the panel off)
     Brightness {
         /// Brightness, 0-100
         #[arg(value_parser = value_parser!(u8).range(0..=100))]
+        value: u8,
+    },
+    /// Rotate the picture on the panel (stored; applies to everything shown and uploaded)
+    Rotation {
+        /// 0 = normal, 1 = portrait (90° clockwise), 2 = 180°, 3 = portrait (90° counter-clockwise)
+        #[arg(value_parser = value_parser!(u8).range(0..=3))]
         value: u8,
     },
     /// Print the status again every time it changes (Ctrl+C to stop)
@@ -187,9 +218,208 @@ pub enum Command {
         #[arg(value_enum)]
         action: AutostartAction,
     },
+    /// Update to the newest published release (installed builds only)
+    Update {
+        /// Only report whether a newer release exists
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 /// What to do with the daemon's systemd user service.
+/// What to do with display profiles.
+#[derive(Debug, Subcommand)]
+pub enum ProfileAction {
+    /// List the profiles, their triggers and the active one
+    List {
+        /// Print the profiles as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Save what the panel shows now (source, framing, fps, brightness, rotation) as profile
+    /// NAME; an existing profile keeps its triggers
+    Save {
+        /// Profile name
+        name: String,
+    },
+    /// Switch the panel to a profile
+    Activate {
+        /// Profile name
+        name: String,
+    },
+    /// Delete a profile
+    Delete {
+        /// Profile name
+        name: String,
+    },
+    /// Rename a profile
+    Rename {
+        /// Current name
+        from: String,
+        /// New name
+        to: String,
+    },
+    /// Move a profile in the list (the order breaks ties between triggers)
+    Move {
+        /// Profile name
+        name: String,
+        /// New 1-based position, `up` or `down`
+        #[arg(value_parser = MoveTarget::from_str)]
+        position: MoveTarget,
+    },
+    /// Reset the built-in Default profile to factory settings (clear the panel, brightness 100,
+    /// rotation 0, no triggers)
+    Reset {
+        /// Profile name (only Default can be reset)
+        name: String,
+    },
+    /// Edit when a profile switches on by itself
+    Trigger {
+        #[command(subcommand)]
+        action: TriggerAction,
+    },
+}
+
+/// Where `profile move` puts a profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveTarget {
+    /// A 1-based list position.
+    Position(usize),
+    /// One place towards the front.
+    Up,
+    /// One place towards the back.
+    Down,
+}
+
+impl FromStr for MoveTarget {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "up" => Ok(Self::Up),
+            "down" => Ok(Self::Down),
+            other => match other.parse::<usize>() {
+                Ok(n) if n >= 1 => Ok(Self::Position(n)),
+                _ => Err(format!(
+                    "position must be a number from 1, `up` or `down`, got {s:?}"
+                )),
+            },
+        }
+    }
+}
+
+/// Edits of a profile's triggers.
+#[derive(Debug, Subcommand)]
+pub enum TriggerAction {
+    /// Switch to the profile every day (or on some days) at a time of day
+    AddTime {
+        /// Profile name
+        name: String,
+        /// Time of day, HH:MM (local time)
+        #[arg(value_parser = TimeOfDay::from_str)]
+        time: TimeOfDay,
+        /// Days: mon,tue,wed,thu,fri,sat,sun or weekdays, weekend, daily (default: every day)
+        #[arg(long, value_delimiter = ',', value_parser = parse_day_item)]
+        days: Vec<DayItem>,
+    },
+    /// Switch to the profile while the time of day is inside a range (may wrap past midnight)
+    AddRange {
+        /// Profile name
+        name: String,
+        /// Range start, HH:MM (local time)
+        #[arg(value_parser = TimeOfDay::from_str)]
+        start: TimeOfDay,
+        /// Range end, HH:MM; earlier than the start means the next day
+        #[arg(value_parser = TimeOfDay::from_str)]
+        end: TimeOfDay,
+        /// Days the range starts on: mon,tue,... or weekdays, weekend, daily (default: every day)
+        #[arg(long, value_delimiter = ',', value_parser = parse_day_item)]
+        days: Vec<DayItem>,
+    },
+    /// Switch to the profile while a process runs (its name or executable name)
+    AddProcess {
+        /// Profile name
+        name: String,
+        /// Process name, e.g. game.exe
+        process: String,
+    },
+    /// Remove a time trigger
+    RemoveTime {
+        /// Profile name
+        name: String,
+        /// Time of day, HH:MM
+        #[arg(value_parser = TimeOfDay::from_str)]
+        time: TimeOfDay,
+    },
+    /// Remove a time range
+    RemoveRange {
+        /// Profile name
+        name: String,
+        /// Range start, HH:MM
+        #[arg(value_parser = TimeOfDay::from_str)]
+        start: TimeOfDay,
+        /// Range end, HH:MM
+        #[arg(value_parser = TimeOfDay::from_str)]
+        end: TimeOfDay,
+    },
+    /// Remove a process trigger
+    RemoveProcess {
+        /// Profile name
+        name: String,
+        /// Process name
+        process: String,
+    },
+    /// Remove every trigger of the profile
+    Clear {
+        /// Profile name
+        name: String,
+    },
+}
+
+/// One `--days` item: a day or a shortcut standing for several.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DayItem {
+    /// A single day.
+    Day(Weekday),
+    /// Monday to Friday.
+    Weekdays,
+    /// Saturday and Sunday.
+    Weekend,
+    /// Every day.
+    Daily,
+}
+
+fn parse_day_item(s: &str) -> Result<DayItem, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "weekdays" => Ok(DayItem::Weekdays),
+        "weekend" => Ok(DayItem::Weekend),
+        "daily" => Ok(DayItem::Daily),
+        _ => s
+            .parse::<Weekday>()
+            .map(DayItem::Day)
+            .map_err(|e| format!("{e}; or use weekdays, weekend or daily")),
+    }
+}
+
+/// Expands `--days` items into a sorted list without duplicates; empty means every day.
+pub fn expand_days(items: &[DayItem]) -> Vec<Weekday> {
+    let mut days: Vec<Weekday> = Vec::new();
+    for item in items {
+        match item {
+            DayItem::Day(day) => days.push(*day),
+            DayItem::Weekdays => days.extend(&Weekday::ALL[..5]),
+            DayItem::Weekend => days.extend(&Weekday::ALL[5..]),
+            DayItem::Daily => days.extend(Weekday::ALL),
+        }
+    }
+    days.sort();
+    days.dedup();
+    if days.len() == Weekday::ALL.len() {
+        days.clear();
+    }
+    days
+}
+
 #[derive(Debug, Clone, Copy, Subcommand)]
 pub enum ServiceAction {
     /// Write the unit, then enable and start it
@@ -272,6 +502,17 @@ mod tests {
         let err = parse(&["brightness", "101"]).unwrap_err();
         assert_eq!(err.exit_code(), 2);
         assert!(parse(&["brightness", "-1"]).is_err());
+    }
+
+    #[test]
+    fn rotation_range_is_enforced() {
+        for step in ["0", "1", "2", "3"] {
+            assert!(parse(&["rotation", step]).is_ok(), "{step}");
+        }
+        let err = parse(&["rotation", "4"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(parse(&["rotation", "-1"]).is_err());
+        assert!(parse(&["rotation"]).is_err());
     }
 
     #[test]
@@ -498,6 +739,27 @@ mod tests {
     }
 
     #[test]
+    fn show_portal_parses_reselect() {
+        assert!(matches!(
+            parse(&["show-portal"]).unwrap().command,
+            Command::ShowPortal {
+                reselect: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["show-portal", "--reselect", "--fps", "10"])
+                .unwrap()
+                .command,
+            Command::ShowPortal {
+                reselect: true,
+                fps: Some(10),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn show_screen_and_preview_parse() {
         assert!(matches!(
             parse(&["show-screen"]).unwrap().command,
@@ -541,5 +803,122 @@ mod tests {
             Command::Preview { .. }
         ));
         assert_eq!(parse(&["preview"]).unwrap_err().exit_code(), 2);
+    }
+    #[test]
+    fn move_target_parses() {
+        assert_eq!("3".parse(), Ok(MoveTarget::Position(3)));
+        assert_eq!("UP".parse(), Ok(MoveTarget::Up));
+        assert_eq!("down".parse(), Ok(MoveTarget::Down));
+        assert!("0".parse::<MoveTarget>().is_err());
+        assert!("-1".parse::<MoveTarget>().is_err());
+        assert!("sideways".parse::<MoveTarget>().is_err());
+    }
+
+    #[test]
+    fn days_shortcuts_expand() {
+        let weekdays = expand_days(&[DayItem::Weekdays]);
+        assert_eq!(weekdays, Weekday::ALL[..5]);
+        assert_eq!(expand_days(&[DayItem::Weekend]), Weekday::ALL[5..]);
+        assert!(expand_days(&[DayItem::Daily]).is_empty());
+        assert!(expand_days(&[]).is_empty());
+        assert_eq!(
+            expand_days(&[
+                DayItem::Day(Weekday::Sun),
+                DayItem::Day(Weekday::Mon),
+                DayItem::Weekdays
+            ]),
+            [
+                Weekday::Mon,
+                Weekday::Tue,
+                Weekday::Wed,
+                Weekday::Thu,
+                Weekday::Fri,
+                Weekday::Sun
+            ]
+        );
+        assert!(parse_day_item("funday").is_err());
+        assert_eq!(parse_day_item("Tue"), Ok(DayItem::Day(Weekday::Tue)));
+    }
+
+    #[test]
+    fn profile_trigger_add_time_parses() {
+        let cli = parse(&[
+            "profile", "trigger", "add-time", "Night", "22:00", "--days", "weekdays",
+        ])
+        .unwrap();
+        let Command::Profile {
+            action:
+                ProfileAction::Trigger {
+                    action: TriggerAction::AddTime { name, time, days },
+                },
+        } = cli.command
+        else {
+            panic!("wrong command");
+        };
+        assert_eq!(name, "Night");
+        assert_eq!(time, TimeOfDay::new(22, 0).unwrap());
+        assert_eq!(days, [DayItem::Weekdays]);
+        assert!(parse(&["profile", "trigger", "add-time", "Night", "24:00"]).is_err());
+    }
+
+    #[test]
+    fn profile_range_and_reset_parse() {
+        let cli = parse(&[
+            "profile",
+            "trigger",
+            "add-range",
+            "Night",
+            "22:00",
+            "06:00",
+            "--days",
+            "weekdays",
+        ])
+        .unwrap();
+        let Command::Profile {
+            action:
+                ProfileAction::Trigger {
+                    action:
+                        TriggerAction::AddRange {
+                            name,
+                            start,
+                            end,
+                            days,
+                        },
+                },
+        } = cli.command
+        else {
+            panic!("wrong command");
+        };
+        assert_eq!(name, "Night");
+        assert_eq!(start, TimeOfDay::new(22, 0).unwrap());
+        assert_eq!(end, TimeOfDay::new(6, 0).unwrap());
+        assert_eq!(days, [DayItem::Weekdays]);
+        assert!(
+            parse(&[
+                "profile",
+                "trigger",
+                "remove-range",
+                "Night",
+                "22:00",
+                "06:00"
+            ])
+            .is_ok()
+        );
+        assert!(parse(&["profile", "trigger", "add-range", "Night", "22:00"]).is_err());
+        let cli = parse(&["profile", "reset", "Default"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Profile {
+                action: ProfileAction::Reset { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn profile_move_parses() {
+        assert!(parse(&["profile", "move", "Night", "2"]).is_ok());
+        assert!(parse(&["profile", "move", "Night", "up"]).is_ok());
+        assert!(parse(&["profile", "move", "Night", "0"]).is_err());
+        assert!(parse(&["profile", "move", "Night"]).is_err());
     }
 }

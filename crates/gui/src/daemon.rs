@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use tt500_lcd_ipc::{Client, ClientError, PreviewReply, Request, Status};
+use tt500_lcd_ipc::{Client, ClientError, PreviewReply, ProfilesReply, Request, Status};
 
 /// Delay between reconnect attempts while the daemon is down.
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -82,6 +82,15 @@ pub fn preview(socket: &Path) -> Result<PreviewReply, String> {
     client.preview().map_err(describe)
 }
 
+/// Fetches the saved profiles and the daemon status.
+///
+/// # Errors
+/// Returns user-facing text, e.g. when the daemon is too old for profiles.
+pub fn profiles(socket: &Path) -> Result<ProfilesReply, String> {
+    let mut client = Client::connect(socket).map_err(describe)?;
+    client.profiles().map_err(describe)
+}
+
 pub(crate) fn describe(error: ClientError) -> String {
     match error {
         ClientError::Connect { .. } => "tt500-lcdd is not running".to_owned(),
@@ -106,7 +115,9 @@ mod tests {
             device: DeviceState::Idle,
             content: None,
             brightness,
+            rotation: None,
             content_error: None,
+            profile: None,
         }
     }
 

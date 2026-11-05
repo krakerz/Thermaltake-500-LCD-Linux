@@ -1,4 +1,4 @@
-//! Minimal command line: `-h`, `-v`.
+//! Minimal command line: `-h`, `-v`, `--hidden`.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -10,8 +10,8 @@ pub enum Command {
     Help,
     /// Print the version and exit.
     Version,
-    /// Run the app.
-    Run,
+    /// Run the app; `hidden` starts it in the tray without showing the window.
+    Run { hidden: bool },
 }
 
 /// A command-line usage error.
@@ -35,6 +35,7 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut options_ended = false;
+    let mut hidden = false;
     for arg in args.into_iter().skip(1) {
         let text = arg.to_string_lossy();
         if options_ended {
@@ -43,6 +44,7 @@ where
         match text.as_ref() {
             "-h" | "--help" => return Ok(Command::Help),
             "-v" | "--version" => return Ok(Command::Version),
+            "--hidden" => hidden = true,
             "--" => options_ended = true,
             other if other.starts_with('-') => {
                 return Err(UsageError(format!("unknown option '{other}'")));
@@ -50,7 +52,7 @@ where
             other => return Err(UsageError(format!("unexpected argument '{other}'"))),
         }
     }
-    Ok(Command::Run)
+    Ok(Command::Run { hidden })
 }
 
 /// The text printed by `--help`.
@@ -64,6 +66,7 @@ pub fn help() -> String {
          Options:\n\
          \x20 -h, --help       Print this help\n\
          \x20 -v, --version    Print the version\n\
+         \x20     --hidden     Start in the tray without showing the window\n\
          \x20     --           End of options\n\
          \n\
          It talks to the tt500-lcdd daemon, which must be running.\n",
@@ -85,7 +88,7 @@ mod tests {
 
     #[test]
     fn defaults_to_run() {
-        assert_eq!(run(&[]), Ok(Command::Run));
+        assert_eq!(run(&[]), Ok(Command::Run { hidden: false }));
     }
 
     #[test]
@@ -97,6 +100,14 @@ mod tests {
     }
 
     #[test]
+    fn hidden_flag() {
+        assert_eq!(run(&["--hidden"]), Ok(Command::Run { hidden: true }));
+        assert_eq!(run(&["--hidden", "--"]), Ok(Command::Run { hidden: true }));
+        assert!(run(&["--hidden", "extra"]).is_err());
+        assert!(help().contains("--hidden"));
+    }
+
+    #[test]
     fn unknown_option_is_an_error() {
         assert!(run(&["--bogus"]).is_err());
         assert!(run(&["-x"]).is_err());
@@ -105,7 +116,7 @@ mod tests {
 
     #[test]
     fn double_dash_ends_options() {
-        assert_eq!(run(&["--"]), Ok(Command::Run));
+        assert_eq!(run(&["--"]), Ok(Command::Run { hidden: false }));
         assert!(run(&["--", "extra"]).is_err());
     }
 }
