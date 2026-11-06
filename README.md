@@ -4,6 +4,13 @@ Show images, animations and videos on the Thermaltake Tower 500 LCD panel kit (R
 
 Product page: [LCD Panel Kit for The Tower 500](https://thermaltake.com/products/lcd-panel-kit-for-the-tower-500) (USB `264a:232a`).
 
+![TT500 LCD: a virtual desktop running a GPU monitor, cropped onto the panel](https://gist.githubusercontent.com/krakerz/26f00ce4bb280b20fe8407ac08510726/raw/area.png)
+
+<p>
+  <img src="https://gist.githubusercontent.com/krakerz/26f00ce4bb280b20fe8407ac08510726/raw/boot.png" alt="Writing a standby image to the panel" width="49%">
+  <img src="https://gist.githubusercontent.com/krakerz/26f00ce4bb280b20fe8407ac08510726/raw/profiles.png" alt="Profiles with a time-range trigger" width="49%">
+</p>
+
 ## Description
 
 The panel kit has no Linux software. A small user daemon (`tt500-lcdd`) owns the panel's USB HID device and streams the chosen content to it. A command-line tool (`tt500-lcd`) and a GTK4 app (`tt500-lcd-gui`) control the daemon over a Unix socket. The protocol was worked out from our own USB captures.
