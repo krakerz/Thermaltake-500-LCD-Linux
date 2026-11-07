@@ -401,6 +401,14 @@ impl ProfileHub {
         }
     }
 
+    /// Drops the last manual choice (its own time range ended), so a fallback skips it.
+    pub fn forget_manual(&self) {
+        let mut book = self.lock();
+        if book.data.last_manual.take().is_some() {
+            self.save_markers(&book);
+        }
+    }
+
     /// How many direct changes happened so far.
     pub fn direct_changes(&self) -> u64 {
         self.lock().direct_changes

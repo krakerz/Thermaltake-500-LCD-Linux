@@ -141,7 +141,7 @@ tt500-lcd profile trigger add-process Game game.exe
 - Also: `rename`, `delete`, `move`, `reset Default`, `trigger remove-time|remove-range|remove-process|clear`
 - `--days` takes `mon,tue,...`, `weekdays`, `weekend` or `daily`
 - The built-in `Default` profile always exists and is the fallback; it cannot be renamed or deleted
-- Priority: running process > active time range > latest schedule entry > your manual pick > Default
+- Priority: running process > active time range > latest schedule entry > your manual pick > Default; a manual pick is dropped when its own time range ends
 - A direct `show` or `clear` marks the active profile "(changed)"
 
 ### Graphical app

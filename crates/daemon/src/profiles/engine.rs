@@ -86,6 +86,21 @@ pub enum Step {
     },
 }
 
+/// The outcome of one tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tick {
+    /// What to do with the display.
+    pub step: Step,
+    /// The last manual choice's own time range ended (or was missed): the scheduler must
+    /// clear `last_manual`, so the profile is not revived by the fallback.
+    pub forget_manual: bool,
+}
+
+/// Whether any time range of `profile` contains `now`.
+fn covered(profile: &Profile, now: NaiveDateTime) -> bool {
+    profile.triggers.ranges.iter().any(|r| in_range(r, now))
+}
+
 /// First profile, in list order, with a trigger process in `running`, and that process.
 #[must_use]
 pub fn process_winner<'a>(
@@ -180,12 +195,18 @@ pub fn latest_schedule(
 /// built-in Default) is applied at edges only: a schedule time crossed, the process or range
 /// winner changed, or the first tick after start or a
 /// large backward clock jump. Between edges whatever is active holds.
-pub fn tick(cursor: &mut Cursor, inputs: &Inputs<'_>) -> Step {
+///
+/// The last manual choice is what a process or range profile falls back to when it ends,
+/// but never a profile whose own time range just ended (or ended unseen, before a start or
+/// a clock jump): that one is dropped (`forget_manual`) and the fallback skips it.
+pub fn tick(cursor: &mut Cursor, inputs: &Inputs<'_>) -> Tick {
     let first = cursor.now.is_none();
     let jumped_back = cursor
         .now
         .is_some_and(|prev| prev - inputs.now > BACKWARD_JUMP);
     let full = first || jumped_back;
+    let prev_now = cursor.now;
+    let prev_range = cursor.range_winner.clone();
 
     let schedule = latest_schedule(inputs.profiles, inputs.now);
     let schedule_at = schedule.map(|(at, _)| at);
@@ -211,8 +232,32 @@ pub fn tick(cursor: &mut Cursor, inputs: &Inputs<'_>) -> Step {
     cursor.range_winner = range_name;
     cursor.dirty = false;
 
+    let forget_manual = inputs
+        .last_manual
+        .and_then(|name| inputs.profiles.iter().find(|p| p.name == name))
+        .is_some_and(|p| {
+            if p.triggers.ranges.is_empty() || covered(p, inputs.now) {
+                return false;
+            }
+            if full {
+                winner.is_none_or(|(w, _)| w.name != p.name)
+                    && schedule.is_none_or(|(_, s)| s.name != p.name)
+            } else {
+                prev_range.as_deref() == Some(p.name.as_str())
+                    || prev_now.is_some_and(|prev| covered(p, prev))
+            }
+        });
+    let last_manual = if forget_manual {
+        None
+    } else {
+        inputs.last_manual
+    };
+
     if !(full || schedule_edge || winner_edge || range_edge) {
-        return Step::Nothing;
+        return Tick {
+            step: Step::Nothing,
+            forget_manual,
+        };
     }
 
     let wanted = if let Some((profile, process)) = winner {
@@ -234,7 +279,7 @@ pub fn tick(cursor: &mut Cursor, inputs: &Inputs<'_>) -> Step {
         schedule.map(|(_, profile)| (profile.name.as_str(), ProfileReason::Schedule))
     };
 
-    match wanted {
+    let step = match wanted {
         Some((name, reason)) => match inputs.active {
             Some(active) if active.name == name && active.reason == reason => Step::Nothing,
             Some(active) if active.name == name => Step::Relabel { reason },
@@ -243,14 +288,14 @@ pub fn tick(cursor: &mut Cursor, inputs: &Inputs<'_>) -> Step {
                 reason,
             },
         },
-        None if first => match inputs.active {
+        None if first && !forget_manual => match inputs.active {
             // Start-up: restored content stays, only its label is corrected.
             Some(active) if active.reason != ProfileReason::Manual => Step::Relabel {
                 reason: ProfileReason::Manual,
             },
             _ => Step::Nothing,
         },
-        None => match (inputs.last_manual, inputs.active) {
+        None => match (last_manual, inputs.active) {
             (Some(name), Some(active)) if active.name == name => {
                 if active.reason == ProfileReason::Manual {
                     Step::Nothing
@@ -266,6 +311,10 @@ pub fn tick(cursor: &mut Cursor, inputs: &Inputs<'_>) -> Step {
             },
             (None, _) => fallback(inputs),
         },
+    };
+    Tick {
+        step,
+        forget_manual,
     }
 }
 
@@ -393,6 +442,17 @@ mod tests {
         active: Option<&Active>,
         last_manual: Option<&str>,
     ) -> Step {
+        run_tick(cursor, profiles, now, running, active, last_manual).step
+    }
+
+    fn run_tick(
+        cursor: &mut Cursor,
+        profiles: &[Profile],
+        now: NaiveDateTime,
+        running: &BTreeSet<String>,
+        active: Option<&Active>,
+        last_manual: Option<&str>,
+    ) -> Tick {
         tick(
             cursor,
             &Inputs {
@@ -1041,5 +1101,109 @@ mod tests {
                 Step::Nothing
             );
         }
+    }
+
+    fn gpu_profiles() -> [Profile; 2] {
+        [
+            default_profile(),
+            ranged("gpu", vec![range(5, 0, 18, 0, &[])]),
+        ]
+    }
+
+    #[test]
+    fn manual_in_range_then_range_end_goes_to_default() {
+        let p = gpu_profiles();
+        let none = set(&[]);
+        let mut c = Cursor::new();
+        let g = active("gpu", range_reason(5, 0, 18, 0));
+        run(&mut c, &p, at(3, 12, 0), &none, Some(&g), Some("gpu"));
+        let m = active("gpu", ProfileReason::Manual);
+        let t = run_tick(&mut c, &p, at(3, 18, 0), &none, Some(&m), Some("gpu"));
+        assert!(t.forget_manual);
+        assert_eq!(t.step, activate("Default", ProfileReason::Fallback));
+    }
+
+    #[test]
+    fn manual_outside_range_holds_until_range_start_then_default_at_end() {
+        let p = gpu_profiles();
+        let none = set(&[]);
+        let mut c = Cursor::new();
+        let m = active("gpu", ProfileReason::Manual);
+        run(&mut c, &p, at(3, 20, 0), &none, Some(&m), None);
+        let t = run_tick(&mut c, &p, at(3, 22, 0), &none, Some(&m), Some("gpu"));
+        assert_eq!(t.step, Step::Nothing);
+        assert!(!t.forget_manual);
+        let t = run_tick(&mut c, &p, at(4, 5, 0), &none, Some(&m), Some("gpu"));
+        assert_eq!(
+            t.step,
+            Step::Relabel {
+                reason: range_reason(5, 0, 18, 0)
+            }
+        );
+        assert!(!t.forget_manual);
+        let r = active("gpu", range_reason(5, 0, 18, 0));
+        let t = run_tick(&mut c, &p, at(4, 18, 0), &none, Some(&r), Some("gpu"));
+        assert!(t.forget_manual);
+        assert_eq!(t.step, activate("Default", ProfileReason::Fallback));
+    }
+
+    #[test]
+    fn process_exit_returns_to_manual_non_ranged_profile() {
+        let p = [
+            default_profile(),
+            profile("game", &["game"], vec![]),
+            profile("manual", &[], vec![]),
+        ];
+        let mut c = Cursor::new();
+        let m = active("manual", ProfileReason::Manual);
+        run(
+            &mut c,
+            &p,
+            at(3, 12, 0),
+            &set(&[]),
+            Some(&m),
+            Some("manual"),
+        );
+        let g = active("game", proc_reason("game"));
+        run(
+            &mut c,
+            &p,
+            at(3, 12, 1),
+            &set(&["game"]),
+            Some(&m),
+            Some("manual"),
+        );
+        let t = run_tick(
+            &mut c,
+            &p,
+            at(3, 12, 2),
+            &set(&[]),
+            Some(&g),
+            Some("manual"),
+        );
+        assert!(!t.forget_manual);
+        assert_eq!(t.step, activate("manual", ProfileReason::Manual));
+    }
+
+    #[test]
+    fn resume_after_range_ended_while_suspended_goes_to_default() {
+        let p = gpu_profiles();
+        let none = set(&[]);
+        let mut c = Cursor::new();
+        let m = active("gpu", ProfileReason::Manual);
+        run(&mut c, &p, at(3, 17, 0), &none, Some(&m), Some("gpu"));
+        let t = run_tick(&mut c, &p, at(3, 20, 33), &none, Some(&m), Some("gpu"));
+        assert!(t.forget_manual);
+        assert_eq!(t.step, activate("Default", ProfileReason::Fallback));
+    }
+
+    #[test]
+    fn start_outside_range_does_not_hold_manual_ranged_profile() {
+        let p = gpu_profiles();
+        let mut c = Cursor::new();
+        let m = active("gpu", ProfileReason::Manual);
+        let t = run_tick(&mut c, &p, at(3, 20, 33), &set(&[]), Some(&m), Some("gpu"));
+        assert!(t.forget_manual);
+        assert_eq!(t.step, activate("Default", ProfileReason::Fallback));
     }
 }

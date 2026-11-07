@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-07
+
+### Fixed
+
+- Profiles: a hand-activated profile with a time range no longer stays active after its range ends (or ended while the daemon was stopped or the machine suspended); the daemon drops that manual pick and falls back to the next trigger or Default. A manual pick still holds between trigger edges and is still restored when a process profile exits
+
 ## [0.5.0] - 2026-11-05
 
 ### Added
