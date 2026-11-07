@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "tt500-lcd"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1974,7 +1974,7 @@ dependencies = [
 
 [[package]]
 name = "tt500-lcd-gui"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-channel",
  "directories",
@@ -1995,7 +1995,7 @@ dependencies = [
 
 [[package]]
 name = "tt500-lcd-ipc"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2006,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "tt500-lcd-protocol"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "hidapi",
  "thiserror",
@@ -2014,7 +2014,7 @@ dependencies = [
 
 [[package]]
 name = "tt500-lcd-render"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "image",
  "jpeg-encoder",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "tt500-lcd-setup"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -2035,7 +2035,7 @@ dependencies = [
 
 [[package]]
 name = "tt500-lcd-update"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "flate2",
  "serde",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "tt500-lcdd"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "chrono",

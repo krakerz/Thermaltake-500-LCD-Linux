@@ -79,7 +79,7 @@ impl<C: Clock, L: ProcessLister> Scheduler<C, L> {
             Default::default()
         };
         let now = self.clock.now();
-        let step = hub.with_tick(|profiles, cursor, active, last_manual| {
+        let tick = hub.with_tick(|profiles, cursor, active, last_manual| {
             engine::tick(
                 cursor,
                 &Inputs {
@@ -91,7 +91,10 @@ impl<C: Clock, L: ProcessLister> Scheduler<C, L> {
                 },
             )
         });
-        match step {
+        if tick.forget_manual {
+            hub.forget_manual();
+        }
+        match tick.step {
             Step::Nothing => self.retry_pending(hub, applier, now_instant),
             Step::Activate { name, reason } => {
                 self.retry = None;
